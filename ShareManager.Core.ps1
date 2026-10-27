@@ -22,7 +22,7 @@ $script:AppName    = 'WinShareManager'
 # 界面标题、状态栏、exe 文件版本、关于信息全部读这里。
 # 构建脚本从本文件解析 $script:AppVersion，同步给 ps2exe 的 -version，
 # 所以发版只需要改这一行。
-$script:AppVersion  = '2.1.0'
+$script:AppVersion  = '2.1.1'
 $script:AppRepoName = 'qianweighost/WinShareManager'
 $script:AppRepoUrl  = 'https://github.com/qianweighost/WinShareManager'
 $script:AppReleaseUrl = "$($script:AppRepoUrl)/releases/latest"
@@ -1277,9 +1277,10 @@ function Get-DlnaUuid {
         $h = [uint64](($h * 16777619) -band 4294967295)
     }
     $hex = '{0:x16}' -f $h
-    $hex = $hex + $hex.Substring(0, 8)
+    # UUID 需要 32 个十六进制字符；FNV-1a 32 位只有 16 位，整段复制一份补齐到 32
+    $hex = ($hex + $hex)
     return ('{0}-{1}-{2}-{3}-{4}' -f $hex.Substring(0,8), $hex.Substring(8,4),
-            $hex.Substring(12,4), $hex.Substring(16,4), $hex.Substring(20,12).PadRight(12,'0'))
+            $hex.Substring(12,4), $hex.Substring(16,4), $hex.Substring(20,12))
 }
 
 $script:DlnaHttpWorker = @'
