@@ -22,7 +22,7 @@ $script:AppName    = 'WinShareManager'
 # 界面标题、状态栏、exe 文件版本、关于信息全部读这里。
 # 构建脚本从本文件解析 $script:AppVersion，同步给 ps2exe 的 -version，
 # 所以发版只需要改这一行。
-$script:AppVersion  = '2.1.1'
+$script:AppVersion  = '2.1.2'
 $script:AppRepoName = 'qianweighost/WinShareManager'
 $script:AppRepoUrl  = 'https://github.com/qianweighost/WinShareManager'
 $script:AppReleaseUrl = "$($script:AppRepoUrl)/releases/latest"
@@ -481,6 +481,9 @@ function New-ShareEntry {
     if ($Name -match '[\\/:*?"<>|]') {
         Write-Op '共享名中包含非法字符。' 'ERR'; return $false
     }
+    # 防御：路径若带首尾空白/换行（粘贴路径常见），会原样写进 IIS 配置，
+    # 之后 WAS 对该站点所有启停操作都报 0x800710D8。必须在入口清洗。
+    $Path = $Path.Trim()
     if (-not (Test-Path $Path)) {
         try {
             New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -1933,7 +1936,9 @@ function Start-Protocol {
                 if ($w3 -and $w3.Status -ne 'Running') { Start-Service W3SVC -ErrorAction SilentlyContinue }
                 $fs = Get-Service FTPSVC -ErrorAction SilentlyContinue
                 if ($fs -and $fs.Status -ne 'Running') { Start-Service FTPSVC -ErrorAction SilentlyContinue }
-                Start-Website -Name $cfg.FtpSite -ErrorAction Stop
+                # FTP 站点不能用 Start-Website（走 HTTP/W3SVC 通道，报 0x800710D8），
+                # 必须经 ftpServer 对象启动
+                (Get-Website -Name $cfg.FtpSite).ftpServer.Start()
                 Write-Op 'FTP 站点已启动。' 'OK'
                 return $true
             }
@@ -1980,7 +1985,9 @@ function Stop-Protocol {
                 if (-not (Get-Website -Name $cfg.FtpSite -ErrorAction SilentlyContinue)) {
                     Write-Op 'FTP 站点不存在。' 'ERR'; return $false
                 }
-                Stop-Website -Name $cfg.FtpSite -ErrorAction Stop
+                # FTP 站点不能用 Stop-Website（走 HTTP/W3SVC 通道，报 0x800710D8），
+                # 必须经 ftpServer 对象停止
+                (Get-Website -Name $cfg.FtpSite).ftpServer.Stop()
                 Write-Op 'FTP 站点已停止（WebDAV 不受影响）。' 'OK'
                 return $true
             }
