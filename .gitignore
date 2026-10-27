@@ -1,0 +1,19 @@
+# ---- 构建产物（由 构建单文件.ps1 生成，不纳入版本库）----
+WinShareManager.exe
+WinShareManager.ps1
+WinShareManager.exe.win32manifest
+app.ico
+
+# ---- 备份 / 临时 ----
+*.bak
+*.bak.*
+*.tmp
+*.log
+_old/
+_bak/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
