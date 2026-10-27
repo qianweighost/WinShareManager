@@ -1,6 +1,6 @@
 # WinShareManager
 
-[![version](https://img.shields.io/badge/version-2.0.0-2f7bf6)](https://github.com/qianweighost/WinShareManager/releases/latest)
+[![version](https://img.shields.io/badge/version-2.0.1-2f7bf6)](https://github.com/qianweighost/WinShareManager/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-34a84a)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-8e8e93)](#)
 [![release](https://img.shields.io/github/v/release/qianweighost/WinShareManager?label=release&color=f5a623)](https://github.com/qianweighost/WinShareManager/releases/latest)

@@ -22,7 +22,7 @@ $script:AppName    = 'WinShareManager'
 # 界面标题、状态栏、exe 文件版本、关于信息全部读这里。
 # 构建脚本从本文件解析 $script:AppVersion，同步给 ps2exe 的 -version，
 # 所以发版只需要改这一行。
-$script:AppVersion  = '2.0.0'
+$script:AppVersion  = '2.0.1'
 $script:AppRepoName = 'qianweighost/WinShareManager'
 $script:AppRepoUrl  = 'https://github.com/qianweighost/WinShareManager'
 $script:AppReleaseUrl = "$($script:AppRepoUrl)/releases/latest"
@@ -892,6 +892,45 @@ function Get-PathPermission {
 # ============================================================
 # 协议级控制（每个协议独立：安装 / 启动 / 停止）
 # ============================================================
+# 共享数量：直接读 LanmanServer 的注册表键（毫秒级）。
+# Get-SmbShare 首次调用要加载整个 CIM/SMB 模块，实测 5~7 秒，
+# 放在启动路径上就是明显的「点了没反应」。
+function Get-SmbShareCountFast {
+    # 用 .NET 的注册表 API 而不是 Get-ItemProperty + 管道：
+    # 后者实测要多花 900 ms 左右（PowerShell 管道 + PSObject 属性枚举的开销），
+    # 直接读值名列表是毫秒级。
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+            'SYSTEM\CurrentControlSet\Services\LanmanServer\Shares')
+        if ($null -eq $key) { throw 'registry key missing' }
+        $names = $key.GetValueNames()
+        $key.Dispose()
+
+        # 以 $ 开头的是系统共享（C$ / IPC$ / ADMIN$），不计入
+        $c = 0
+        foreach ($n in $names) {
+            if ($n.Length -gt 0 -and $n[0] -ne '$') { $c++ }
+        }
+        return $c
+    } catch {
+        return @(Get-SmbShare -ErrorAction SilentlyContinue | Where-Object { -not $_.Special }).Count
+    }
+}
+
+# 共享名列表（毫秒级）。Get-SmbShare 首次调用要 5~7 秒，不能放在启动路径上。
+function Get-SmbShareNamesFast {
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+            'SYSTEM\CurrentControlSet\Services\LanmanServer\Shares')
+        if ($null -eq $key) { throw 'registry key missing' }
+        $names = @($key.GetValueNames())
+        $key.Dispose()
+        return $names
+    } catch {
+        return @(Get-SmbShare -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    }
+}
+
 function Get-ProtocolList {
     $cfg  = Get-Config
     $list = @()
@@ -899,7 +938,7 @@ function Get-ProtocolList {
     # ---------- SMB ----------
     $lan     = Get-Service LanmanServer -ErrorAction SilentlyContinue
     $smbRun  = [bool]($lan -and $lan.Status -eq 'Running')
-    $smbCnt  = @(Get-SmbShare -ErrorAction SilentlyContinue | Where-Object { -not $_.Special }).Count
+    $smbCnt  = Get-SmbShareCountFast
     $list += [pscustomobject]@{
         Key       = 'SMB'
         Name      = 'SMB'
@@ -912,7 +951,7 @@ function Get-ProtocolList {
     }
 
     # ---------- WebDAV ----------
-    $davInstalled = (Test-WinFeature 'IIS-WebServer') -and (Test-WinFeature 'IIS-WebDAV')
+    $davInstalled = (Test-WinFeatureFast 'IIS-WebServer') -and (Test-WinFeatureFast 'IIS-WebDAV')
     $davSite = $null
     if ($davInstalled -and (Initialize-IisModule)) {
         $davSite = Get-Website -Name $cfg.WebDavSite -ErrorAction SilentlyContinue
@@ -939,7 +978,7 @@ function Get-ProtocolList {
     }
 
     # ---------- FTP ----------
-    $ftpInstalled = (Test-WinFeature 'IIS-WebServer') -and (Test-WinFeature 'IIS-FTPServer')
+    $ftpInstalled = (Test-WinFeatureFast 'IIS-WebServer') -and (Test-WinFeatureFast 'IIS-FTPServer')
     $ftpSite = $null
     if ($ftpInstalled -and (Initialize-IisModule)) {
         $ftpSite = Get-Website -Name $cfg.FtpSite -ErrorAction SilentlyContinue
@@ -1132,25 +1171,85 @@ function Stop-Protocol {
 # ============================================================
 # 插件 / 组件中心
 # ============================================================
+# 特性探测有两条路，用途不同，别混用：
+#
+#   Test-WinFeature      — 真问 DISM（Get-WindowsOptionalFeature），语义准确，
+#                          但首次调用约 5 秒，而且 DISM 全局只有一个会话锁，
+#                          多个实例同时启动会互相排队，能拖到分钟级。
+#                          只用于「要不要执行安装」这种必须准确的场合。
+#
+#   Test-WinFeatureFast  — 只看 inetsrv 下的文件 / 服务注册键，毫秒级。
+#                          用于界面展示「已安装 / 未安装」。
+#
+# 两者都带进程内缓存，重复刷新不再重复付出代价。
+$script:FeatureCache = @{}
+
+function Test-WinFeatureFast {
+    param([string]$Name, [switch]$Fresh)
+
+    if (-not $Fresh -and $script:FeatureCache.ContainsKey("fast:$Name")) {
+        return $script:FeatureCache["fast:$Name"]
+    }
+
+    $inetsrv = Join-Path $env:windir 'System32\inetsrv'
+    $result  = $false
+    switch ($Name) {
+        'IIS-WebServerRole'     { $result = Test-Path (Join-Path $inetsrv 'w3wp.exe') }
+        'IIS-WebServer'         { $result = Test-Path (Join-Path $inetsrv 'w3wp.exe') }
+        'IIS-WebDAV'            { $result = Test-Path (Join-Path $inetsrv 'webdav.dll') }
+        'IIS-FTPServer'         { $result = Test-Path (Join-Path $inetsrv 'ftpsvc.dll') }
+        'IIS-FTPSvc'            { $result = Test-Path (Join-Path $inetsrv 'ftpsvc.dll') }
+        'IIS-ManagementConsole' {
+            $result = (Test-Path (Join-Path $inetsrv 'inetsrv.dll')) -and
+                      (Test-Path 'HKLM:\SOFTWARE\Microsoft\InetMgr')
+        }
+        default {
+            # 认不出来的特性名，退回 DISM（有缓存兜底，最多慢一次）
+            return (Test-WinFeature -Name $Name)
+        }
+    }
+    $script:FeatureCache["fast:$Name"] = [bool]$result
+    return [bool]$result
+}
+
 function Test-WinFeature {
-    param([string]$Name)
+    param([string]$Name, [switch]$Fresh)
+
+    if (-not $Fresh -and $script:FeatureCache.ContainsKey($Name)) {
+        return $script:FeatureCache[$Name]
+    }
     try {
         $f = Get-WindowsOptionalFeature -Online -FeatureName $Name -ErrorAction Stop
-        return ($f.State -eq 'Enabled')
+        $ok = ($f.State -eq 'Enabled')
     } catch {
-        return $false
+        $ok = $false
     }
+    $script:FeatureCache[$Name] = [bool]$ok
+    return [bool]$ok
 }
 
 function Test-OpenSshServer {
-    try {
-        $c = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop |
-             Select-Object -First 1
-        if ($c -and $c.State -eq 'Installed') { return $true }
-    } catch { }
+    param([switch]$Fresh)
 
-    # 便携版（手工解压）不体现在能力包里，磁盘上有 sshd.exe 也算装了
-    return [bool](Find-SshdBinary)
+    if (-not $Fresh -and $script:FeatureCache.ContainsKey('openssh')) {
+        return $script:FeatureCache['openssh']
+    }
+
+    # 快速路径：磁盘上有 sshd.exe 就算装了（约 20ms）。
+    # 能力包查询是 DISM，冷启动 0.6~5 秒，而且 wuauserv 被掏空的机器上
+    # 会长时间挂住 —— 所以先看文件，找不到再问，问了也没用就直接放弃。
+    $ok = [bool](Find-SshdBinary)
+
+    if (-not $ok -and (Test-WuServiceUsable)) {
+        try {
+            $c = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop |
+                 Select-Object -First 1
+            if ($c -and $c.State -eq 'Installed') { $ok = $true }
+        } catch { }
+    }
+
+    $script:FeatureCache['openssh'] = [bool]$ok
+    return [bool]$ok
 }
 
 function Test-Ps2Exe {
@@ -1529,7 +1628,7 @@ function Install-OpenSshServer {
 function Get-PluginList {
     $list = @()
 
-    $iisWeb = (Test-WinFeature 'IIS-WebServerRole') -and (Test-WinFeature 'IIS-WebServer')
+    $iisWeb = (Test-WinFeatureFast 'IIS-WebServerRole') -and (Test-WinFeatureFast 'IIS-WebServer')
     $list += [pscustomobject]@{
         Key       = 'IIS-WEB'
         Name      = 'IIS Web 服务器'
@@ -1538,7 +1637,7 @@ function Get-PluginList {
         Detail    = if ($iisWeb) { '已启用' } else { '未启用' }
     }
 
-    $dav = Test-WinFeature 'IIS-WebDAV'
+    $dav = Test-WinFeatureFast 'IIS-WebDAV'
     $list += [pscustomobject]@{
         Key       = 'IIS-WEBDAV'
         Name      = 'IIS WebDAV 发布'
@@ -1547,7 +1646,7 @@ function Get-PluginList {
         Detail    = if ($dav) { '已启用' } else { '未启用' }
     }
 
-    $ftp = (Test-WinFeature 'IIS-FTPServer') -and (Test-WinFeature 'IIS-FTPSvc')
+    $ftp = (Test-WinFeatureFast 'IIS-FTPServer') -and (Test-WinFeatureFast 'IIS-FTPSvc')
     $list += [pscustomobject]@{
         Key       = 'IIS-FTP'
         Name      = 'IIS FTP 服务'

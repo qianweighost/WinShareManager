@@ -713,6 +713,72 @@ function New-Badge {
     return $l
 }
 
+# ---- 链接图标（仓库入口：不放明文地址，画一个链环，点一下打开浏览器）----
+# 颜色一律塞进 Tag：事件处理器的执行作用域拿不到定义处的局部变量。
+function New-LinkIcon {
+    param([string]$Url = '', [string]$Tip = '', [int]$Size = 24)
+
+    if (-not $script:Tip) {
+        $script:Tip = New-Object System.Windows.Forms.ToolTip
+        $script:Tip.ShowAlways   = $true
+        $script:Tip.InitialDelay = 300
+        $script:Tip.ReshowDelay  = 100
+        $script:Tip.AutoPopDelay = 8000
+    }
+
+    $p           = New-Object System.Windows.Forms.Label
+    $p.Size      = New-Object System.Drawing.Size($Size, $Size)
+    $p.AutoSize  = $false
+    $p.BackColor = $clrBg
+    $p.Cursor    = 'Hand'
+    $p.Tag       = @{
+        Url        = $Url
+        Hover      = $false
+        Color      = $clrAccent
+        ColorHover = [System.Drawing.Color]::FromArgb(0, 90, 200)
+    }
+
+    $p.Add_Paint({
+        param($s, $e)
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear($s.BackColor)
+
+        $st   = $s.Tag
+        $col  = if ($st.Hover) { $st.ColorHover } else { $st.Color }
+        $pen  = New-Object System.Drawing.Pen($col, [single]1.7)
+        $cx   = $s.Width  / 2.0
+        $cy   = $s.Height / 2.0
+        $w    = [int][Math]::Round($s.Width  * 0.52)
+        $h    = [int][Math]::Round($s.Height * 0.30)
+        $r    = [int][Math]::Floor($h / 2)
+        $off  = [single]($s.Width * 0.13)
+
+        # 两个倾斜 45° 的圆角矩形扣在一起 = 链环
+        foreach ($dx in @(-$off, $off)) {
+            $gr = $g.Save()
+            $g.TranslateTransform([single]($cx + $dx), [single]$cy)
+            $g.RotateTransform(45)
+            $path = Get-RoundRect -X ([int](-$w / 2)) -Y ([int](-$h / 2)) -W $w -H $h -R $r
+            $g.DrawPath($pen, $path)
+            $path.Dispose()
+            $g.Restore($gr)
+        }
+        $pen.Dispose()
+    })
+
+    $p.Add_MouseEnter({ param($s, $e) $s.Tag.Hover = $true;  $s.Invalidate() })
+    $p.Add_MouseLeave({ param($s, $e) $s.Tag.Hover = $false; $s.Invalidate() })
+    $p.Add_Click({
+        param($s, $e)
+        $u = [string]$s.Tag.Url
+        if ($u) { try { Start-Process -FilePath $u } catch { } }
+    })
+
+    if ($Tip) { $script:Tip.SetToolTip($p, $Tip) }
+    return $p
+}
+
 function Set-BadgeStyle {
     param($Badge, [string]$Style)
     switch ($Style) {
@@ -756,6 +822,17 @@ function New-Grid {
     $g.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(252, 252, 254)
     return $g
 }
+
+# ============================================================
+# 三·一、启动计时（设 WSM_TRACE=1 后会把各阶段耗时写进日志，用于排查「启动慢」）
+# ============================================================
+$script:StartSw = [Diagnostics.Stopwatch]::StartNew()
+function Trace-Startup {
+    param([string]$Stage)
+    if (-not $env:WSM_TRACE) { return }
+    Write-Op ("启动阶段 {0,6} ms  {1}" -f $script:StartSw.ElapsedMilliseconds, $Stage) 'INFO'
+}
+Trace-Startup '界面层开始'
 
 # ============================================================
 # 三·五、程序图标（标题栏 / 任务栏 / Alt-Tab）
@@ -850,12 +927,18 @@ if ($isAdmin) {
 }
 $lblWho.Invalidate()
 
-$header.Controls.AddRange(@($lblTitle, $lblVer, $lblWho))
+# 仓库入口：图标而不是明文地址（版本号右边那个链环）
+$lnkRepo = New-LinkIcon -Url $script:AppRepoUrl -Size 24 `
+           -Tip ("打开 GitHub 仓库 {0}`n{1}" -f $script:AppRepoName, $script:AppReleaseUrl)
+
+$header.Controls.AddRange(@($lblTitle, $lblVer, $lnkRepo, $lblWho))
 $header.Add_Resize({
-    $lblWho.Left = $header.ClientSize.Width - $lblWho.Width - 28
-    $lblVer.Left = $lblTitle.Right + 10
+    $lblWho.Left   = $header.ClientSize.Width - $lblWho.Width - 28
+    $lblVer.Left   = $lblTitle.Right + 10
+    $lnkRepo.Left  = $lblVer.Right + 8
 })
-$lblVer.Location = New-Object System.Drawing.Point(($lblTitle.Right + 10), ($lblTitle.Top + 6))
+$lblVer.Location  = New-Object System.Drawing.Point(($lblTitle.Right + 10), ($lblTitle.Top + 6))
+$lnkRepo.Location = New-Object System.Drawing.Point(($lblVer.Right + 8), ($lblTitle.Top + 4))
 
 # ---- 分段导航（胶囊）----
 $segWrap           = New-Object System.Windows.Forms.Panel
@@ -1308,21 +1391,7 @@ if ($isAdmin) {
     $statusAdmin.ForeColor = $clrOrange
 }
 
-# 仓库链接：点一下在默认浏览器打开（标题里也带版本号，状态栏补一条可点的 GitHub）
-$statusGit              = New-Object System.Windows.Forms.ToolStripStatusLabel
-$statusGit.Text         = "GitHub · $($script:AppRepoName)"
-$statusGit.IsLink       = $true
-$statusGit.LinkColor    = $clrAccent
-$statusGit.ActiveLinkColor = $clrAccent
-$statusGit.TextAlign    = 'MiddleRight'
-$statusGit.Margin       = New-Object System.Windows.Forms.Padding(0, 0, 16, 0)
-$statusGit.ToolTipText  = "$($script:AppRepoUrl)`n点击在浏览器中打开（含最新 Release 下载）"
-$statusGit.Add_Click({
-    try { Start-Process -FilePath $script:AppRepoUrl } catch { }
-})
-
 [void]$statusBar.Items.Add($statusLabel)
-[void]$statusBar.Items.Add($statusGit)
 [void]$statusBar.Items.Add($statusAdmin)
 
 $form.Controls.Add($content)
@@ -1406,7 +1475,7 @@ function Refresh-ShareView {
 
     $smbNames = @()
     try {
-        $smbNames = @(Get-SmbShare -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+        $smbNames = @(Get-SmbShareNamesFast)
     } catch { }
 
     # 按共享名分组：每个协议一行，组首行显示共享名与路径，后续行只显示协议（树形符表现层级）
@@ -1434,15 +1503,21 @@ function Refresh-ShareView {
                     $ok   = ($smbNames -contains $s.Name)
                 }
                 'WebDAV' {
-                    $link = "http://$env:COMPUTERNAME`:$($cfg.WebDavPort)/$($s.Name)"
+                    # 路径部分必须做 URL 编码：中文共享名拼成裸 http://.../共享
+                    # 在很多客户端里直接失败，编码成 %E5%85%B1%E4%BA%AB 才通用
+                    $link = "http://$env:COMPUTERNAME`:$($cfg.WebDavPort)/$([Uri]::EscapeDataString($s.Name))"
                     $ok   = [bool]$running['WebDAV']
                 }
                 'FTP' {
-                    $link = "ftp://$env:COMPUTERNAME`:$($cfg.FtpPort)/$($s.Name)"
+                    $link = "ftp://$env:COMPUTERNAME`:$($cfg.FtpPort)/$([Uri]::EscapeDataString($s.Name))"
                     $ok   = [bool]$running['FTP']
                 }
                 'SFTP' {
-                    $link = "sftp://$env:COMPUTERNAME/" + ($s.Path -replace '\\', '/')
+                    # 不能拼成 sftp://主机/D:/目录 —— 那是 Windows 盘符塞进 URL，
+                    # 任何 SFTP 客户端都解析不了，而且 sftp:// 也没有系统级处理器。
+                    # 这里只给主机，真正的远程路径（服务器上的 Windows 绝对路径）
+                    # 交给「打开」按钮复制到剪贴板。
+                    $link = "sftp://$env:COMPUTERNAME"
                     $ok   = [bool]$running['SFTP']
                 }
             }
@@ -1493,6 +1568,27 @@ function Refresh-ShareView {
         $gridShare.Columns['复制'].HeaderCell.ToolTipText = '把这一行的链接复制到剪贴板'
     }
 
+    # 「打开」：链接本身在很多地方粘不进去（ftp:// 现代浏览器已不支持、sftp:// 没有系统处理器），
+    # 所以这里按协议挑一个真正打得开的动作。
+    if (-not $gridShare.Columns.Contains('打开')) {
+        $col                           = New-Object System.Windows.Forms.DataGridViewLinkColumn
+        $col.Name                      = '打开'
+        $col.HeaderText                = '打开'
+        $col.Text                      = '打开'
+        $col.UseColumnTextForLinkValue = $true
+        $col.LinkColor                 = $clrGreen
+        $col.ActiveLinkColor           = [System.Drawing.Color]::FromArgb(24, 128, 56)
+        $col.VisitedLinkColor          = $clrGreen
+        $col.TrackVisitedState         = $false
+        $col.AutoSizeMode              = 'None'
+        $col.Width                     = 62
+        $col.SortMode                  = 'NotSortable'
+        $col.DefaultCellStyle.Alignment = 'MiddleCenter'
+        $col.DefaultCellStyle.Padding   = New-Object System.Windows.Forms.Padding(0)
+        [void]$gridShare.Columns.Add($col)
+        $gridShare.Columns['打开'].HeaderCell.ToolTipText = 'SMB / WebDAV / FTP 用资源管理器或浏览器打开；SFTP 复制服务器上的绝对路径'
+    }
+
     # 每行单独删除一个协议（共享名是组首，协议才是这一行真正对应的东西）
     if (-not $gridShare.Columns.Contains('删除')) {
         $col                           = New-Object System.Windows.Forms.DataGridViewLinkColumn
@@ -1512,8 +1608,11 @@ function Refresh-ShareView {
         [void]$gridShare.Columns.Add($col)
         $gridShare.Columns['删除'].HeaderCell.ToolTipText = '只删除这一行的协议，同一共享的其它协议继续可用'
     }
-    try { $gridShare.Columns['复制'].DisplayIndex = $gridShare.Columns.Count - 2 } catch { }
-    try { $gridShare.Columns['删除'].DisplayIndex = $gridShare.Columns.Count - 1 } catch { }
+    try {
+        $gridShare.Columns['复制'].DisplayIndex = $gridShare.Columns.Count - 3
+        $gridShare.Columns['打开'].DisplayIndex = $gridShare.Columns.Count - 2
+        $gridShare.Columns['删除'].DisplayIndex = $gridShare.Columns.Count - 1
+    } catch { }
 
     # 列宽权重：链接拿最大份额，保证完整显示不被截断
     try {
@@ -2271,6 +2370,52 @@ $gridShare.Add_CellContentClick({
         return
     }
 
+    # ---- 打开（按协议挑一个打得开的动作）----
+    if ($colName -eq '打开') {
+        $proto = [string]$sender.Rows[$e.RowIndex].Cells['协议键'].Value
+        $link  = [string]$sender.Rows[$e.RowIndex].Cells['链接'].Value
+        $path  = [string]$sender.Rows[$e.RowIndex].Cells['物理路径'].Value
+        $name  = [string]$sender.Rows[$e.RowIndex].Cells['共享名'].Value
+
+        switch ($proto) {
+            'SMB' {
+                try {
+                    Start-Process explorer.exe -ArgumentList $link
+                    Set-Status "已在资源管理器中打开 $link"
+                } catch {
+                    [void][System.Windows.Forms.MessageBox]::Show("打开失败：$($_.Exception.Message)", '提示', 'OK', 'Warning')
+                }
+            }
+            'WebDAV' {
+                # http:// 交给默认浏览器；要挂成驱动器得先 net start WebClient
+                try {
+                    Start-Process -FilePath $link
+                    Set-Status "已在浏览器中打开 $link"
+                } catch {
+                    [void][System.Windows.Forms.MessageBox]::Show("打开失败：$($_.Exception.Message)", '提示', 'OK', 'Warning')
+                }
+            }
+            'FTP' {
+                # 现代浏览器都已移除 ftp:// 支持，交给资源管理器的 FTP 文件夹
+                try {
+                    Start-Process explorer.exe -ArgumentList $link
+                    Set-Status "已在资源管理器中打开 $link（打不开请用 FileZilla 等 FTP 客户端）"
+                } catch {
+                    [void][System.Windows.Forms.MessageBox]::Show("打开失败：$($_.Exception.Message)", '提示', 'OK', 'Warning')
+                }
+            }
+            'SFTP' {
+                # sftp:// 没有系统级处理器；SFTP 客户端要的是服务器上的 Windows 绝对路径
+                try { [System.Windows.Forms.Clipboard]::SetText($path) } catch { }
+                [void][System.Windows.Forms.MessageBox]::Show(
+                    "SFTP 没有系统级链接处理器，需要 WinSCP / FileZilla 这类客户端。",
+                    'SFTP 打开方式', 'OK', 'Information')
+                Set-Status "已复制远程路径 $path · 粘到 SFTP 客户端的远程目录里"
+            }
+        }
+        return
+    }
+
     # ---- 删除这一行的协议 ----
     if ($colName -eq '删除') {
         $name  = [string]$sender.Rows[$e.RowIndex].Cells['共享名'].Value
@@ -2414,7 +2559,20 @@ $btnRevokePerm.Add_Click({
 Set-PermLevel -Level 'Read'
 Show-Page -Index 0
 
+# 首轮状态刷新。抽成独立函数有两个目的：
+#   1) Timer 回调里只调用它，回调体保持极简（作用域坑少）
+#   2) 界面自检（WSM_SMOKE）也能直接调用，真正测到这条路径
+function Invoke-StartupRefresh {
+    try { Refresh-ProtocolView } catch { Write-Op "协议状态读取失败：$($_.Exception.Message)" 'ERR' }
+    try { Refresh-ShareView }    catch { Write-Op "共享读取失败：$($_.Exception.Message)" 'ERR' }
+    try { Refresh-UserView }     catch { Write-Op "用户读取失败：$($_.Exception.Message)" 'ERR' }
+    try { Refresh-AclView }      catch { }
+    Trace-Startup '首轮状态刷新完成'
+    Set-Status '就绪'
+}
+
 $form.Add_Shown({
+    Trace-Startup '窗体已显示（Shown 触发）'
     Write-Op "程序启动 v$($script:AppVersion)，运行身份：$([Security.Principal.WindowsIdentity]::GetCurrent().Name)" 'INFO'
     if (-not $isAdmin) {
         Write-Op '当前非管理员身份，安装组件与修改共享会失败，请右键「以管理员身份运行」。' 'WARN'
@@ -2422,10 +2580,26 @@ $form.Add_Shown({
     # 全窗体开双缓冲，消除拖动缩放窗口时的残影线条
     Enable-DoubleBufferTree -Ctrl $form
     $form.Invalidate()
-    try { Refresh-ProtocolView } catch { Write-Op "协议状态读取失败：$($_.Exception.Message)" 'ERR' }
-    try { Refresh-ShareView }    catch { Write-Op "共享读取失败：$($_.Exception.Message)" 'ERR' }
-    try { Refresh-UserView }     catch { Write-Op "用户读取失败：$($_.Exception.Message)" 'ERR' }
-    try { Refresh-AclView }      catch { }
+
+    # 首轮状态刷新放到 120ms 后的一次性 Timer 里跑：
+    # Shown 事件是在窗口刚创建、还没画第一帧的时候同步执行的，
+    # 在这里直接刷状态（读 IIS 模块 / DISM / SMB）会把「窗口出现」
+    # 卡在后面好几秒，看起来就像「点了没反应、进程在但没窗口」。
+    #
+    # 注意：Timer 必须挂在 $script: 上，且回调里用 param($s,$e) 拿发送者 ——
+    # 事件处理器的执行作用域看不到这里定义的局部变量（局部 $timer 会是 null），
+    # 一旦在回调里引用就会抛「不能对 Null 值表达式调用方法」。
+    Set-Status '正在检测系统状态 ...'
+    $script:StartupTimer          = New-Object System.Windows.Forms.Timer
+    $script:StartupTimer.Interval = 120
+    $script:StartupTimer.Add_Tick({
+        param($s, $e)
+        $s.Stop()
+        $s.Dispose()
+        $script:StartupTimer = $null
+        Invoke-StartupRefresh
+    })
+    $script:StartupTimer.Start()
 })
 
 # ---- 构建自检（仅设置 WSM_SMOKE=1 时启用，不显示窗口）----
@@ -2451,9 +2625,28 @@ if ($env:WSM_SMOKE -eq '1') {
     try {
         $verOk = ($form.Text -like "*v$($script:AppVersion)*")
         if (-not $verOk) { $fail++ }
-        $log.Add(("版本与链接 : {0}  标题「{1}」  仓库 {2}" -f `
-                  $(if ($verOk) { 'OK' } else { 'FAIL' }), $form.Text, $script:AppRepoName))
+        $lnkOk = ($null -ne $lnkRepo) -and ($lnkRepo.Tag.Url -eq $script:AppRepoUrl)
+        if (-not $lnkOk) { $fail++ }
+        # 明文地址不应该再出现在状态栏里
+        $plain = (@($statusBar.Items) | Where-Object { $_.Text -like "*$($script:AppRepoName)*" }).Count
+        if ($plain -gt 0) { $fail++ }
+        $log.Add(("版本与链接 : {0}  标题「{1}」  仓库图标 {2}  状态栏明文 {3}" -f `
+                  $(if ($verOk -and $lnkOk -and $plain -eq 0) { 'OK' } else { 'FAIL' }),
+                  $form.Text, $(if ($lnkOk) { 'OK' } else { 'FAIL' }), $plain))
     } catch { $fail++; $log.Add("版本与链接 : FAIL $($_.Exception.Message)") }
+
+    # 启动耗时：探测必须走缓存与文件级判断，不能碰 DISM
+    try {
+        $script:FeatureCache.Clear()
+        $t1 = [Diagnostics.Stopwatch]::StartNew(); [void](Get-ProtocolList); $t1.Stop()
+        $t2 = [Diagnostics.Stopwatch]::StartNew(); [void](Get-PluginList);   $t2.Stop()
+        $t3 = [Diagnostics.Stopwatch]::StartNew(); [void](Get-ProtocolList); $t3.Stop()
+        $slow = ($t1.ElapsedMilliseconds -gt 2500)
+        if ($slow) { $fail++ }
+        $log.Add(("探测耗时 : 协议 {0} ms / 插件 {1} ms / 缓存命中 {2} ms  {3}" -f `
+                  $t1.ElapsedMilliseconds, $t2.ElapsedMilliseconds, $t3.ElapsedMilliseconds,
+                  $(if ($slow) { 'FAIL 超过 2.5 秒' } else { 'OK' })))
+    } catch { $log.Add("探测耗时 : 测量失败 $($_.Exception.Message)") }
 
     foreach ($i in 0..($script:Pages.Count - 1)) {
         try {
@@ -2471,6 +2664,12 @@ if ($env:WSM_SMOKE -eq '1') {
             $log.Add(("刷新 {0} : OK" -f $fn))
         } catch { $fail++; $log.Add(("刷新 {0} : FAIL {1}" -f $fn, $_.Exception.Message)) }
     }
+
+    # 真正走一遍启动刷新路径（Timer 回调里调用的就是它）
+    try {
+        Invoke-StartupRefresh
+        $log.Add(("启动刷新路径 : OK（状态栏「{0}」）" -f $statusLabel.Text))
+    } catch { $fail++; $log.Add("启动刷新路径 : FAIL $($_.Exception.Message)") }
 
     try {
         Set-PermLevel -Level 'Write'
@@ -2568,5 +2767,6 @@ if ($env:WSM_SMOKE -eq '1') {
     exit 0
 }
 
+Trace-Startup '窗体构建完成，准备 ShowDialog'
 [void]$form.ShowDialog()
 $form.Dispose()
