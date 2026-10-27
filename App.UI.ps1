@@ -1270,10 +1270,10 @@ function New-ProtocolCard {
 $tlp               = New-Object System.Windows.Forms.TableLayoutPanel
 $tlp.Dock          = 'Fill'
 $tlp.ColumnCount   = 1
-$tlp.RowCount      = 4
+$tlp.RowCount      = 5
 $tlp.AutoScroll    = $true
 $tlp.BackColor     = $clrBg
-for ($i = 0; $i -lt 4; $i++) {
+for ($i = 0; $i -lt 5; $i++) {
     $rs = New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 116)
     [void]$tlp.RowStyles.Add($rs)
 }
@@ -1282,6 +1282,7 @@ for ($i = 0; $i -lt 4; $i++) {
 [void]$tlp.Controls.Add((New-ProtocolCard -Key 'WebDAV' -Title 'WebDAV' -Hint '浏览器 / 手机 / 跨平台客户端挂载'),   0, 1)
 [void]$tlp.Controls.Add((New-ProtocolCard -Key 'FTP'    -Title 'FTP'    -Hint '传统设备、扫描仪、老式终端接入'),       0, 2)
 [void]$tlp.Controls.Add((New-ProtocolCard -Key 'SFTP'   -Title 'SFTP'   -Hint 'SSH 加密通道，走 OpenSSH Server'),      0, 3)
+[void]$tlp.Controls.Add((New-ProtocolCard -Key 'DLNA'   -Title 'DLNA'   -Hint '电视 / 机顶盒 / 手机自动发现，内置媒体服务器'), 0, 4)
 
 $pageProto.Controls.Add($tlp)
 $pageProto.Controls.Add($barProto)
@@ -1582,7 +1583,7 @@ function Refresh-ProtocolView {
             Set-BadgeStyle -Badge $c.Badge -Style 'warn'
         }
 
-        if ($p.Key -eq 'SMB') {
+        if ($p.Key -in @('SMB', 'DLNA')) {
             Set-CtrlText -Ctrl $c.Install -Text '系统内置'
             $c.Install.Enabled = $false
         } else {
@@ -1656,6 +1657,11 @@ function Refresh-ShareView {
                     # 交给「打开」按钮复制到剪贴板。
                     $link = "sftp://$env:COMPUTERNAME"
                     $ok   = [bool]$running['SFTP']
+                }
+                'DLNA' {
+                    # DLNA 没有可直接点开的链接：设备在「网络邻居 / 媒体设备」里自动发现
+                    $link = "dlna://$env:COMPUTERNAME`:$($cfg.DlnaPort)/"
+                    $ok   = [bool]$running['DLNA']
                 }
             }
 
@@ -1977,19 +1983,24 @@ function Show-NewShareDialog {
     $cbSftp.Location = New-Object System.Drawing.Point(116, 208)
     $cbSftp.AutoSize = $true
 
-    $lNote = New-DialogLabel -Text '备注' -X 28 -Y 254
+    $cbDlna          = New-Object System.Windows.Forms.CheckBox
+    $cbDlna.Text     = 'DLNA    ·  电视 / 手机自动发现（无密码，内网可读）'
+    $cbDlna.Location = New-Object System.Drawing.Point(116, 238)
+    $cbDlna.AutoSize = $true
+
+    $lNote = New-DialogLabel -Text '备注' -X 28 -Y 284
     $tNote          = New-Object System.Windows.Forms.TextBox
-    $tNote.Location = New-Object System.Drawing.Point(116, 250)
+    $tNote.Location = New-Object System.Drawing.Point(116, 280)
     $tNote.Size     = New-Object System.Drawing.Size(438, 28)
     $tNote.BorderStyle = 'FixedSingle'
 
     $ok              = New-Pill -Text '创建' -Width 100 -Kind 'primary'
     $ok.DialogResult = 'OK'
-    $ok.Location     = New-Object System.Drawing.Point(336, 320)
+    $ok.Location     = New-Object System.Drawing.Point(336, 350)
 
     $cancel              = New-Pill -Text '取消' -Width 100
     $cancel.DialogResult = 'Cancel'
-    $cancel.Location     = New-Object System.Drawing.Point(448, 320)
+    $cancel.Location     = New-Object System.Drawing.Point(448, 350)
 
     $btnBrowse.Add_Click({
         $fb             = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -1998,7 +2009,7 @@ function Show-NewShareDialog {
     })
 
     $dlg.Controls.AddRange(@($lName, $tName, $lPath, $tPath, $btnBrowse,
-                             $lProto, $cbSmb, $cbDav, $cbFtp, $cbSftp,
+                             $lProto, $cbSmb, $cbDav, $cbFtp, $cbSftp, $cbDlna,
                              $lNote, $tNote, $ok, $cancel))
     $dlg.AcceptButton = $ok
     $dlg.CancelButton = $cancel
@@ -2009,6 +2020,7 @@ function Show-NewShareDialog {
         if ($cbDav.Checked)  { $protos += 'WebDAV' }
         if ($cbFtp.Checked)  { $protos += 'FTP' }
         if ($cbSftp.Checked) { $protos += 'SFTP' }
+        if ($cbDlna.Checked) { $protos += 'DLNA' }
         return [pscustomobject]@{
             Name      = $tName.Text.Trim()
             Path      = $tPath.Text.Trim()
@@ -2021,46 +2033,54 @@ function Show-NewShareDialog {
 
 function Show-SettingsDialog {
     $cfg = Get-Config
-    $dlg = New-DialogBase -Title '管理设置' -W 600 -H 336
+    $dlg = New-DialogBase -Title '管理设置' -W 680 -H 372
 
     $lRoot = New-DialogLabel -Text '共享根目录' -X 28 -Y 32
     $tRoot          = New-Object System.Windows.Forms.TextBox
-    $tRoot.Location = New-Object System.Drawing.Point(126, 28)
-    $tRoot.Size     = New-Object System.Drawing.Size(348, 28)
+    $tRoot.Location = New-Object System.Drawing.Point(156, 28)
+    $tRoot.Size     = New-Object System.Drawing.Size(388, 28)
     $tRoot.Text     = [string]$cfg.RootBase
     $tRoot.BorderStyle = 'FixedSingle'
 
     $btnBrowse = New-Pill -Text '浏览' -Width 78
-    $btnBrowse.Location = New-Object System.Drawing.Point(486, 27)
+    $btnBrowse.Location = New-Object System.Drawing.Point(556, 27)
 
+    # 三个端口各占一列：标签与输入框之间留足间距，标签不再被截断
     $lPort1 = New-DialogLabel -Text 'WebDAV 端口' -X 28 -Y 84
     $tPort1          = New-Object System.Windows.Forms.TextBox
-    $tPort1.Location = New-Object System.Drawing.Point(126, 80)
-    $tPort1.Size     = New-Object System.Drawing.Size(120, 28)
+    $tPort1.Location = New-Object System.Drawing.Point(156, 80)
+    $tPort1.Size     = New-Object System.Drawing.Size(110, 28)
     $tPort1.Text     = [string]$cfg.WebDavPort
     $tPort1.BorderStyle = 'FixedSingle'
 
-    $lPort2 = New-DialogLabel -Text 'FTP 端口' -X 286 -Y 84
+    $lPort2 = New-DialogLabel -Text 'FTP 端口' -X 320 -Y 84
     $tPort2          = New-Object System.Windows.Forms.TextBox
-    $tPort2.Location = New-Object System.Drawing.Point(368, 80)
-    $tPort2.Size     = New-Object System.Drawing.Size(106, 28)
+    $tPort2.Location = New-Object System.Drawing.Point(424, 80)
+    $tPort2.Size     = New-Object System.Drawing.Size(110, 28)
     $tPort2.Text     = [string]$cfg.FtpPort
     $tPort2.BorderStyle = 'FixedSingle'
 
+    $lPort3 = New-DialogLabel -Text 'DLNA 端口' -X 28 -Y 128
+    $tPort3          = New-Object System.Windows.Forms.TextBox
+    $tPort3.Location = New-Object System.Drawing.Point(156, 124)
+    $tPort3.Size     = New-Object System.Drawing.Size(110, 28)
+    $tPort3.Text     = $(if ($cfg.DlnaPort) { [string]$cfg.DlnaPort } else { '8420' })
+    $tPort3.BorderStyle = 'FixedSingle'
+
     $lHint           = New-Object System.Windows.Forms.Label
-    $lHint.Location  = New-Object System.Drawing.Point(28, 124)
-    $lHint.Size      = New-Object System.Drawing.Size(536, 46)
+    $lHint.Location  = New-Object System.Drawing.Point(28, 172)
+    $lHint.Size      = New-Object System.Drawing.Size(616, 46)
     $lHint.ForeColor = $clrSub
     $lHint.Font      = $fontSmall
-    $lHint.Text      = '根目录可填任意本地路径（不存在会自动创建）。端口改动后需点「重建 IIS 站点」才会生效。'
+    $lHint.Text      = '根目录可填任意本地路径（不存在会自动创建）。WebDAV / FTP 端口改动后需点「重建 IIS 站点」才会生效；DLNA 端口保存后自动生效。'
 
     $ok              = New-Pill -Text '保存' -Width 100 -Kind 'primary'
     $ok.DialogResult = 'OK'
-    $ok.Location     = New-Object System.Drawing.Point(352, 204)
+    $ok.Location     = New-Object System.Drawing.Point(384, 248)
 
     $cancel              = New-Pill -Text '取消' -Width 100
     $cancel.DialogResult = 'Cancel'
-    $cancel.Location     = New-Object System.Drawing.Point(464, 204)
+    $cancel.Location     = New-Object System.Drawing.Point(496, 248)
 
     $btnBrowse.Add_Click({
         $fb             = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -2069,12 +2089,12 @@ function Show-SettingsDialog {
     })
 
     $dlg.Controls.AddRange(@($lRoot, $tRoot, $btnBrowse, $lPort1, $tPort1,
-                             $lPort2, $tPort2, $lHint, $ok, $cancel))
+                             $lPort2, $tPort2, $lPort3, $tPort3, $lHint, $ok, $cancel))
     $dlg.AcceptButton = $ok
     $dlg.CancelButton = $cancel
 
     if ($dlg.ShowDialog($form) -eq 'OK') {
-        $p1 = 0; $p2 = 0
+        $p1 = 0; $p2 = 0; $p3 = 0
         if (-not [int]::TryParse($tPort1.Text.Trim(), [ref]$p1)) {
             [void][System.Windows.Forms.MessageBox]::Show('WebDAV 端口必须是数字。', '提示', 'OK', 'Warning')
             return $null
@@ -2083,10 +2103,15 @@ function Show-SettingsDialog {
             [void][System.Windows.Forms.MessageBox]::Show('FTP 端口必须是数字。', '提示', 'OK', 'Warning')
             return $null
         }
+        if (-not [int]::TryParse($tPort3.Text.Trim(), [ref]$p3)) {
+            [void][System.Windows.Forms.MessageBox]::Show('DLNA 端口必须是数字。', '提示', 'OK', 'Warning')
+            return $null
+        }
         return [pscustomobject]@{
             RootBase   = $tRoot.Text.Trim()
             WebDavPort = $p1
             FtpPort    = $p2
+            DlnaPort   = $p3
         }
     }
     return $null
@@ -2158,6 +2183,22 @@ $script:Guides = @{
                 '填主机名、端口 22、账号密码') }
         )
         Tip = '登录后能访问哪些目录完全由 NTFS 权限决定（Windows 版 OpenSSH 不支持 ChrootDirectory）。'
+    }
+    'DLNA' = @{
+        Intro = '数字生活网络联盟协议：电视、机顶盒、游戏机、手机播放器自动发现媒体服务器，无需输入任何地址。'
+        Steps = @(
+            @{ OS = '智能电视 / 机顶盒'; Lines = @(
+                '打开自带的「媒体中心 / DLNA / 多屏互动」应用',
+                '设备列表里选「WinShareManager (主机名)」',
+                '按文件夹浏览，直接点播') },
+            @{ OS = 'Windows'; Lines = @(
+                '资源管理器 → 网络 → 媒体设备',
+                '或用 VLC：本地网络 → UPnP / DLNA 发现') },
+            @{ OS = '手机 / 平板'; Lines = @(
+                'VLC / nPlayer / 倍播 等播放器的 DLNA 入口',
+                '选择本设备后按目录点播') }
+        )
+        Tip = '注意：DLNA 协议本身不支持账号密码，勾选 DLNA 的目录对整个局域网只读开放，请只在内网使用。视频支持拖动进度条（HTTP Range）。'
     }
 }
 
@@ -2381,10 +2422,10 @@ foreach ($key in @('SMB', 'WebDAV', 'FTP', 'SFTP')) {
 $btnSettings.Add_Click({
     $data = Show-SettingsDialog
     if (-not $data) { return }
-    if (Save-Settings -RootBase $data.RootBase -WebDavPort $data.WebDavPort -FtpPort $data.FtpPort) {
+    if (Save-Settings -RootBase $data.RootBase -WebDavPort $data.WebDavPort -FtpPort $data.FtpPort -DlnaPort $data.DlnaPort) {
         Refresh-ProtocolView
         [void][System.Windows.Forms.MessageBox]::Show(
-            '设置已保存。若改过端口，请点「重建 IIS 站点」使其生效。',
+            '设置已保存。若改过 WebDAV / FTP 端口，请点「重建 IIS 站点」使其生效。',
             '已保存', 'OK', 'Information')
     }
 })
@@ -2608,6 +2649,18 @@ $gridShare.Add_CellContentClick({
                     'SFTP 打开方式', 'OK', 'Information')
                 Set-Status "已复制远程路径 $path · 粘到 SFTP 客户端的远程目录里"
             }
+            'DLNA' {
+                # DLNA 没有系统级处理器：设备在网络邻居 / 播放器里自动发现
+                [void][System.Windows.Forms.MessageBox]::Show(
+                    "DLNA 不需要「打开」，设备会自动发现本服务器：`r`n`r`n" +
+                    "· 智能电视 / 机顶盒：打开「媒体中心 / DLNA / 多屏互动」应用`r`n" +
+                    "· Windows：资源管理器 → 网络 → 媒体设备`r`n" +
+                    "· 手机 / 平板：VLC、nPlayer 等播放器的 DLNA 入口`r`n`r`n" +
+                    "设备列表里选「WinShareManager ($env:COMPUTERNAME)」即可浏览点播。`r`n" +
+                    "注意：DLNA 无账号密码，勾选 DLNA 的目录对整个局域网只读开放。",
+                    'DLNA 使用方式', 'OK', 'Information')
+                Set-Status 'DLNA 设备会自动发现本服务器 · 在电视或播放器的媒体列表里选择'
+            }
         }
         return
     }
@@ -2763,6 +2816,14 @@ function Invoke-StartupRefresh {
     try { Refresh-ShareView }    catch { Write-Op "共享读取失败：$($_.Exception.Message)" 'ERR' }
     try { Refresh-UserView }     catch { Write-Op "用户读取失败：$($_.Exception.Message)" 'ERR' }
     try { Refresh-AclView }      catch { }
+    # 有勾选 DLNA 的共享就自动拉起内置媒体服务器（协议随程序进程存活）
+    try {
+        $dlnaShares = @(Get-ShareList | Where-Object { $_.Protocols -contains 'DLNA' })
+        if ($dlnaShares.Count -gt 0 -and -not $script:Dlna.Running -and (Test-Admin)) {
+            [void](Start-DlnaServer)
+            Refresh-ProtocolView
+        }
+    } catch { Write-Op "DLNA 自动启动失败：$($_.Exception.Message)" 'WARN' }
     Trace-Startup '首轮状态刷新完成'
     Set-Status '就绪'
 }
@@ -2964,5 +3025,11 @@ if ($env:WSM_SMOKE -eq '1') {
 }
 
 Trace-Startup '窗体构建完成，准备 ShowDialog'
+# 退出时先关掉内置 DLNA 服务器（要给客户端发 byebye，别让设备列表里留尸体）
+$form.Add_FormClosed({
+    try {
+        if ($script:Dlna.Running) { [void](Stop-DlnaServer) }
+    } catch { }
+})
 [void]$form.ShowDialog()
 $form.Dispose()

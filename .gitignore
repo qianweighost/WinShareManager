@@ -1,5 +1,5 @@
-# ---- 构建产物（由 构建单文件.ps1 生成，不纳入版本库）----
-WinShareManager.exe
+# ---- 构建产物（由 build.ps1 生成，不纳入版本库）----
+WinShareManager*.exe
 WinShareManager.ps1
 WinShareManager.exe.win32manifest
 app.ico

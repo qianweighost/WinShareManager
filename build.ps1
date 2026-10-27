@@ -25,7 +25,6 @@ if (-not $root) { $root = (Get-Location).Path }
 $corePath = Join-Path $root 'ShareManager.Core.ps1'
 $uiPath   = Join-Path $root 'App.UI.ps1'
 $outPs1   = Join-Path $root 'WinShareManager.ps1'
-$outExe   = Join-Path $root 'WinShareManager.exe'
 $icoPath  = Join-Path $root 'app.ico'
 
 foreach ($p in @($corePath, $uiPath)) {
@@ -57,6 +56,7 @@ if (-not $vm.Success) {
 }
 $appVersion = $vm.Groups[1].Value
 $asmVersion = if ($appVersion -match '^\d+\.\d+\.\d+$') { "$appVersion.0" } else { $appVersion }
+$outExe     = Join-Path $root ("WinShareManager_v" + $appVersion + ".exe")
 Write-Step ("版本号 {0} → 程序集版本 {1}" -f $appVersion, $asmVersion)
 
 $before = $core.Length

@@ -22,7 +22,7 @@ $script:AppName    = 'WinShareManager'
 # 界面标题、状态栏、exe 文件版本、关于信息全部读这里。
 # 构建脚本从本文件解析 $script:AppVersion，同步给 ps2exe 的 -version，
 # 所以发版只需要改这一行。
-$script:AppVersion  = '2.0.2'
+$script:AppVersion  = '2.1.0'
 $script:AppRepoName = 'qianweighost/WinShareManager'
 $script:AppRepoUrl  = 'https://github.com/qianweighost/WinShareManager'
 $script:AppReleaseUrl = "$($script:AppRepoUrl)/releases/latest"
@@ -129,6 +129,7 @@ function Get-Config {
         RootBase   = 'D:\Share'
         WebDavPort = 8081
         FtpPort    = 21
+        DlnaPort   = 8420
         WebDavSite = 'WSS-WebDAV'
         FtpSite    = 'WSS-FTP'
         Shares     = @()
@@ -202,15 +203,18 @@ function Install-Environment {
     $rules = @(
         @{ Name = 'WinShareManager-FTP';    Port = $cfg.FtpPort },
         @{ Name = 'WinShareManager-WebDAV'; Port = $cfg.WebDavPort },
-        @{ Name = 'WinShareManager-SFTP';   Port = 22 }
+        @{ Name = 'WinShareManager-SFTP';   Port = 22 },
+        @{ Name = 'WinShareManager-DLNA-TCP'; Port = $(if ($cfg.DlnaPort) { $cfg.DlnaPort } else { 8200 }); Proto = 'UDP_Root' },
+        @{ Name = 'WinShareManager-DLNA-SSDP'; Port = 1900; Proto = 'UDP' }
     )
     foreach ($rule in $rules) {
         try {
             $exist = Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue
             if (-not $exist) {
+                $proto = if ($rule.ContainsKey('Proto') -and $rule.Proto -eq 'UDP') { 'UDP' } else { 'TCP' }
                 New-NetFirewallRule -DisplayName $rule.Name -Direction Inbound `
-                    -Action Allow -Protocol TCP -LocalPort $rule.Port -ErrorAction Stop | Out-Null
-                Write-Op "防火墙已放行 TCP $($rule.Port)（$($rule.Name)）。" 'OK'
+                    -Action Allow -Protocol $proto -LocalPort $rule.Port -ErrorAction Stop | Out-Null
+                Write-Op "防火墙已放行 $($rule.Port)（$($rule.Name)）。" 'OK'
             } else {
                 Write-Op "防火墙规则 $($rule.Name) 已存在，跳过。" 'OK'
             }
@@ -569,6 +573,10 @@ function New-ShareEntry {
         }
     }
 
+    if ($Protocols -contains 'DLNA') {
+        Write-Op "DLNA 已登记：$Path（电视等设备自动发现；DLNA 无账号密码，整个局域网可读）" 'WARN'
+    }
+
     $cfg  = Get-Config
     $list = @(Get-ShareList | Where-Object { $_.Name -ne $Name })
     $list += [pscustomobject]@{
@@ -581,6 +589,8 @@ function New-ShareEntry {
     Save-Config -Config $cfg | Out-Null
 
     if (($Protocols -contains 'WebDAV') -or ($Protocols -contains 'FTP')) { Restart-IisSites }
+    # DLNA 服务器持有共享快照，配置变了要热重建
+    if ($script:Dlna.Running) { [void](Restart-DlnaServer) }
     return $ok
 }
 
@@ -635,6 +645,7 @@ function Remove-ShareEntry {
     Save-Config -Config $cfg | Out-Null
 
     Restart-IisSites
+    if ($script:Dlna.Running) { [void](Restart-DlnaServer) }
     return $true
 }
 
@@ -710,6 +721,9 @@ function Remove-ShareProtocol {
         'SFTP' {
             Write-Op 'SFTP 走绝对路径，没有独立映射，这里只取消登记（目录与 NTFS 权限保持不变）。' 'INFO'
         }
+        'DLNA' {
+            Write-Op 'DLNA 只取消登记（无需删除任何映射）。' 'INFO'
+        }
     }
 
     $rest = @($protos | Where-Object { $_ -ne $Protocol })
@@ -727,6 +741,7 @@ function Remove-ShareProtocol {
     Save-Config -Config $cfg | Out-Null
 
     if (($Protocol -eq 'WebDAV') -or ($Protocol -eq 'FTP')) { Restart-IisSites }
+    if ($script:Dlna.Running) { [void](Restart-DlnaServer) }
 
     if ($rest.Count -eq 0) {
         Write-Op "共享 $Name 已没有任何协议，整条记录已移除（磁盘目录保留）。" 'OK'
@@ -739,7 +754,8 @@ function Remove-ShareProtocol {
 function Save-Settings {    param(
         [string]$RootBase,
         [int]$WebDavPort = 8081,
-        [int]$FtpPort = 21
+        [int]$FtpPort = 21,
+        [int]$DlnaPort = 8200
     )
 
     if (-not $RootBase -or $RootBase.Trim() -eq '') {
@@ -751,8 +767,11 @@ function Save-Settings {    param(
     if ($FtpPort -lt 1 -or $FtpPort -gt 65535) {
         Write-Op 'FTP 端口超出范围（1-65535）。' 'ERR'; return $false
     }
-    if ($WebDavPort -eq $FtpPort) {
-        Write-Op 'WebDAV 与 FTP 不能使用同一端口。' 'ERR'; return $false
+    if ($DlnaPort -lt 1 -or $DlnaPort -gt 65535) {
+        Write-Op 'DLNA 端口超出范围（1-65535）。' 'ERR'; return $false
+    }
+    if ($WebDavPort -eq $FtpPort -or $WebDavPort -eq $DlnaPort -or $FtpPort -eq $DlnaPort) {
+        Write-Op 'WebDAV / FTP / DLNA 三个端口不能相同。' 'ERR'; return $false
     }
 
     if (-not (Test-Path $RootBase)) {
@@ -765,11 +784,16 @@ function Save-Settings {    param(
     }
 
     $cfg = Get-Config
+    $dlnaChanged = ($cfg.DlnaPort -and [int]$cfg.DlnaPort -ne $DlnaPort)
     $cfg.RootBase   = $RootBase
     $cfg.WebDavPort = $WebDavPort
     $cfg.FtpPort    = $FtpPort
+    $cfg | Add-Member -NotePropertyName DlnaPort -NotePropertyValue $DlnaPort -Force
     Save-Config -Config $cfg | Out-Null
-    Write-Op "设置已保存：根目录=$RootBase / WebDAV=$WebDavPort / FTP=$FtpPort" 'OK'
+    Write-Op "设置已保存：根目录=$RootBase / WebDAV=$WebDavPort / FTP=$FtpPort / DLNA=$DlnaPort" 'OK'
+    if ($dlnaChanged -and $script:Dlna.Running) {
+        [void](Restart-DlnaServer)
+    }
     return $true
 }
 
@@ -1176,7 +1200,664 @@ function Get-ProtocolList {
         StateText = $sshState
     }
 
+    # ---------- DLNA ----------
+    $dlnaPort = Get-DlnaPort
+    $dlnaCount = @(Get-ShareList | Where-Object { $_.Protocols -contains 'DLNA' }).Count
+    $dlnaRunning = [bool]$script:Dlna.Running
+    $dlnaDetail = '内置媒体服务器，电视 / 机顶盒 / 手机自动发现'
+    if ($dlnaCount -eq 0) { $dlnaDetail = '还没有勾选 DLNA 的共享（新增共享时勾选）' }
+    elseif (-not $dlnaRunning) { $dlnaDetail = '已就绪，拨动开关启动' }
+    else { $dlnaDetail = "运行中 · 已共享 $dlnaCount 个目录（DLNA 无密码，内网可读）" }
+
+    $list += [pscustomobject]@{
+        Key       = 'DLNA'
+        Name      = 'DLNA'
+        Port      = [string]$dlnaPort
+        Address   = "dlna://$env:COMPUTERNAME`:$dlnaPort/（设备自动发现）"
+        Installed = $true
+        Running   = $dlnaRunning
+        Detail    = $dlnaDetail
+        StateText = if ($dlnaRunning) { '运行中' } else { '已停止' }
+    }
+
     return $list
+}
+
+# ============================================================
+# DLNA —— 内置 UPnP AV 媒体服务器（零依赖，电视 / 手机 / 投屏设备自动发现）
+# ============================================================
+# 纯 .NET 实现：SSDP（UDP 1900 组播）负责被发现，HttpListener（TCP 端口）
+# 提供设备描述 / ContentDirectory 浏览 / 媒体流（支持 Range 拖动）。
+# DLNA 协议本身不支持账号密码，勾选 DLNA 的共享对整个局域网可读。
+$script:Dlna = @{
+    Running = $false
+    State   = $null    # 三个后台 runspace 共享的同步哈希表
+    HttpPs  = $null; HttpRs = $null
+    SsdpPs  = $null; SsdpRs = $null
+    NotifyPs = $null; NotifyRs = $null
+}
+
+function Get-DlnaPort {
+    $cfg = Get-Config
+    if ($cfg.DlnaPort) { return [int]$cfg.DlnaPort }
+    # 8200 是 minidlna 惯用端口，但这台机器上被 SysWOW64\wrdlv4.exe 占用，改用 8420
+    return 8420
+}
+
+function Get-LanIPv4 {
+    # 优先默认路由的物理网卡；排除 WSL/Hyper-V 虚拟交换机（172.16-31 的
+    # vEthernet 地址渲染端根本连不上，选了它 DLNA 就是"看得见连不上"）
+    try {
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+                 Sort-Object RouteMetric | Select-Object -First 1
+        if ($route) {
+            $ip = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop |
+                  Select-Object -First 1
+            if ($ip -and $ip.IPAddress -notlike '169.254*') { return [string]$ip.IPAddress }
+        }
+    } catch { }
+    try {
+        $ip = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+              Where-Object {
+                  $_.IPAddress -notlike '169.254*' -and
+                  $_.IPAddress -ne '127.0.0.1' -and
+                  $_.InterfaceAlias -notmatch 'vEthernet|Loopback|WSL|Hyper-V'
+              } | Select-Object -First 1
+        if ($ip) { return [string]$ip.IPAddress }
+    } catch { }
+    return $null
+}
+
+function Get-DlnaUuid {
+    # 按"机器名+端口"生成稳定 UUID（FNV-1a），重启不变，避免客户端缓存混乱
+    $seed = "WinShareManager-DLNA-$env:COMPUTERNAME-$(Get-DlnaPort)"
+    $h = [uint64]2166136261
+    foreach ($c in $seed.ToCharArray()) {
+        $h = $h -bxor [uint64][int]$c
+        $h = [uint64](($h * 16777619) -band 4294967295)
+    }
+    $hex = '{0:x16}' -f $h
+    $hex = $hex + $hex.Substring(0, 8)
+    return ('{0}-{1}-{2}-{3}-{4}' -f $hex.Substring(0,8), $hex.Substring(8,4),
+            $hex.Substring(12,4), $hex.Substring(16,4), $hex.Substring(20,12).PadRight(12,'0'))
+}
+
+$script:DlnaHttpWorker = @'
+param($state)
+$ErrorActionPreference = 'Continue'
+
+function Esc([string]$s) {
+    if ($null -eq $s) { return '' }
+    return $s.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;')
+}
+function UrlEnc([string]$s) { return [Uri]::EscapeDataString($s) }
+
+$mimeMap = @{
+    'mp4'='video/mp4'; 'm4v'='video/mp4'; 'mkv'='video/x-matroska'; 'avi'='video/x-msvideo'
+    'mov'='video/quicktime'; 'wmv'='video/x-ms-wmv'; 'flv'='video/x-flv'; 'webm'='video/webm'
+    'mpg'='video/mpeg'; 'mpeg'='video/mpeg'; 'ts'='video/mp2t'; 'm2ts'='video/mp2t'; '3gp'='video/3gpp'
+    'mp3'='audio/mpeg'; 'm4a'='audio/mp4'; 'aac'='audio/aac'; 'flac'='audio/flac'
+    'wav'='audio/x-wav'; 'wma'='audio/x-ms-wma'; 'ogg'='audio/ogg'; 'opus'='audio/ogg'
+    'jpg'='image/jpeg'; 'jpeg'='image/jpeg'; 'png'='image/png'; 'gif'='image/gif'
+    'bmp'='image/bmp'; 'webp'='image/webp'
+}
+function Get-Mime([string]$ext) {
+    if ($mimeMap.ContainsKey($ext)) { return $mimeMap[$ext] }
+    return 'application/octet-stream'
+}
+function Get-Class([string]$ext) {
+    $m = Get-Mime $ext
+    if ($m.StartsWith('video/')) { return 'object.item.videoItem.movie' }
+    if ($m.StartsWith('audio/')) { return 'object.item.audioItem.musicTrack' }
+    if ($m.StartsWith('image/')) { return 'object.item.imageItem.photo' }
+    return 'object.item'
+}
+
+# 子项枚举：直接子目录 + 直接子文件（渲染端逐层浏览，不做深层扫描）
+function Get-Children([string]$dir) {
+    $dirs = @()
+    try {
+        $dirs = [IO.Directory]::EnumerateDirectories($dir) | Sort-Object
+    } catch { }
+    $files = @()
+    try {
+        $files = [IO.Directory]::EnumerateFiles($dir) | Sort-Object
+    } catch { }
+    # 前面的逗号阻止 PowerShell 把嵌套数组在管道里展开拍平
+    return ,@(@($dirs), @($files))
+}
+
+function ItemXml([string]$Id, [string]$ParentId, [string]$Title, [string]$UpnpClass,
+                 [string]$ResUrl, [long]$Size, [string]$Mime) {
+    $b = New-Object System.Text.StringBuilder
+    [void]$b.Append('<item id="' + (Esc $Id) + '" parentID="' + (Esc $ParentId) + '" restricted="1">')
+    [void]$b.Append('<dc:title>' + (Esc $Title) + '</dc:title>')
+    [void]$b.Append('<upnp:class>' + $UpnpClass + '</upnp:class>')
+    if ($ResUrl) {
+        [void]$b.Append('<res protocolInfo="http-get:*:' + $Mime + ':*" size="' + $Size + '">' + (Esc $ResUrl) + '</res>')
+    }
+    [void]$b.Append('</item>')
+    return $b.ToString()
+}
+function ContainerXml([string]$Id, [string]$ParentId, [string]$Title, [int]$ChildCount) {
+    return '<container id="' + (Esc $Id) + '" parentID="' + (Esc $ParentId) + '" restricted="1" childCount="' + $ChildCount + '">' +
+           '<dc:title>' + (Esc $Title) + '</dc:title>' +
+           '<upnp:class>object.container.storageFolder</upnp:class></container>'
+}
+
+function MediaUrl([string]$Alias, [string]$Rel) {
+    return 'http://' + $state.Ip + ':' + $state.Port + '/media/' + $Alias + '/' + $Rel
+}
+
+# ObjectID -> (目录路径, 容器ID, 父ID)，'0'=根 's别名'=共享 'c别名/相对路径'=子目录
+function Resolve-Container([string]$ObjId) {
+    $base = 'http://' + $state.Ip + ':' + $state.Port
+    if ($ObjId -eq '0' -or $ObjId -eq '') {
+        return @{ Title = 'Root'; Children = 'shares' }
+    }
+    if ($ObjId.StartsWith('s')) {
+        $alias = $ObjId.Substring(1)
+        foreach ($s in $state.Shares) {
+            if ($s.Alias -eq $alias) {
+                return @{ Title = $s.Name; Path = $s.Path; Id = $ObjId; Parent = '0'; Children = 'dir' }
+            }
+        }
+        return $null
+    }
+    if ($ObjId.StartsWith('c')) {
+        $rest = $ObjId.Substring(1)
+        $i = $rest.IndexOf('/')
+        if ($i -lt 0) { return $null }
+        $alias = $rest.Substring(0, $i)
+        $rel = $rest.Substring($i + 1)
+        foreach ($s in $state.Shares) {
+            if ($s.Alias -eq $alias) {
+                $p = Join-Path $s.Path ($rel.Replace('/', '\'))
+                if ([IO.Directory]::Exists($p)) {
+                    return @{ Title = [IO.Path]::GetFileName($p); Path = $p; Id = $ObjId; Parent = 's' + $alias; Children = 'dir' }
+                }
+                return $null
+            }
+        }
+        return $null
+    }
+    return $null
+}
+
+function BrowseChildrenXml([string]$ObjId) {
+    $out = New-Object System.Text.StringBuilder
+    $count = 0
+    if ($ObjId -eq '0' -or $ObjId -eq '') {
+        foreach ($s in $state.Shares) {
+            $subs = 0
+            try { $subs = [IO.Directory]::GetDirectories($s.Path).Count } catch { }
+            try { $subs += [IO.Directory]::GetFiles($s.Path).Count } catch { }
+            [void]$out.Append((ContainerXml ('s' + $s.Alias) '0' $s.Name $subs))
+            $count++
+        }
+    } else {
+        $c = Resolve-Container $ObjId
+        if (-not $c) { return $null }
+        $pair = Get-Children $c.Path
+        foreach ($d in $pair[0]) {
+            $name = [IO.Path]::GetFileName($d)
+            $rel = [IO.Path]::GetFullPath($d).Substring([IO.Path]::GetFullPath($c.Path).Length).Replace('\', '/').Trim('/')
+            $cid = 'c' + $ObjId.Substring(1) + '/' + $rel
+            $subs = 0
+            try { $subs = [IO.Directory]::GetDirectories($d).Count } catch { }
+            try { $subs += [IO.Directory]::GetFiles($d).Count } catch { }
+            [void]$out.Append((ContainerXml $cid $c.Id $name $subs))
+            $count++
+        }
+        foreach ($f in $pair[1]) {
+            $name = [IO.Path]::GetFileName($f)
+            $ext = [IO.Path]::GetExtension($f).TrimStart('.').ToLower()
+            $rel = [IO.Path]::GetFullPath($f).Substring([IO.Path]::GetFullPath($c.Path).Length).Replace('\', '/').Trim('/')
+            $fi = Get-Item -LiteralPath $f -ErrorAction SilentlyContinue
+            $size = 0; if ($fi) { $size = $fi.Length }
+            $mime = Get-Mime $ext
+            if ($mime -eq 'application/octet-stream') { continue }
+            [void]$out.Append((ItemXml ($c.Id + '/' + $rel) $c.Id $name (Get-Class $ext) (MediaUrl ($ObjId.Substring(1).Split('/')[0]) $rel) $size $mime))
+            $count++
+        }
+    }
+    return @{ Xml = $out.ToString(); Count = $count }
+}
+
+function BrowseMetadataXml([string]$ObjId) {
+    if ($ObjId -eq '0' -or $ObjId -eq '') {
+        return @{ Xml = (ContainerXml '0' '-1' 'Root' 0); Count = 1 }
+    }
+    $c = Resolve-Container $ObjId
+    if (-not $c) { return $null }
+    $subs = 0
+    try { $subs = [IO.Directory]::GetDirectories($c.Path).Count } catch { }
+    try { $subs += [IO.Directory]::GetFiles($c.Path).Count } catch { }
+    return @{ Xml = (ContainerXml $c.Id $c.Parent $c.Title $subs); Count = 1 }
+}
+
+function SoapBrowse([string]$Body) {
+    $objId = '0'; $flag = 'BrowseDirectChildren'
+    try {
+        $xml = [xml]$Body
+        foreach ($el in $xml.GetElementsByTagName('ObjectID')) { $objId = $el.InnerText; break }
+        foreach ($el in $xml.GetElementsByTagName('BrowseFlag')) { $flag = $el.InnerText; break }
+    } catch { }
+    $r = $null
+    if ($flag -eq 'BrowseMetadata') { $r = BrowseMetadataXml $objId }
+    else { $r = BrowseChildrenXml $objId }
+    if (-not $r) {
+        return '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>701</errorCode><errorDescription>No such object</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>'
+    }
+    $didl = '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">' + $r.Xml + '</DIDL-Lite>'
+    $didlEsc = Esc $didl
+    return '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:BrowseResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><Result>' + $didlEsc + '</Result><NumberReturned>' + $r.Count + '</NumberReturned><TotalMatches>' + $r.Count + '</TotalMatches><SortCapabilities></SortCapabilities><UpdateID>1</UpdateID></u:BrowseResponse></s:Body></s:Envelope>'
+}
+
+function DeviceXml {
+    $b = New-Object System.Text.StringBuilder
+    [void]$b.Append('<?xml version="1.0" encoding="utf-8"?>')
+    [void]$b.Append('<root xmlns="urn:schemas-upnp-org:device-1-0">')
+    [void]$b.Append('<specVersion><major>1</major><minor>0</minor></specVersion>')
+    [void]$b.Append('<URLBase>http://' + $state.Ip + ':' + $state.Port + '/</URLBase>')
+    [void]$b.Append('<device>')
+    [void]$b.Append('<deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>')
+    [void]$b.Append('<friendlyName>' + (Esc $state.Friendly) + '</friendlyName>')
+    [void]$b.Append('<manufacturer>WinShareManager</manufacturer>')
+    [void]$b.Append('<modelName>WinShareManager DLNA</modelName>')
+    [void]$b.Append('<UDN>uuid:' + $state.Uuid + '</UDN>')
+    [void]$b.Append('<serviceList>')
+    [void]$b.Append('<service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType><serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId><SCPDURL>/cds.xml</SCPDURL><controlURL>/cds/control</controlURL><eventSubURL>/cds/event</eventSubURL></service>')
+    [void]$b.Append('<service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType><serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId><SCPDURL>/cm.xml</SCPDURL><controlURL>/cm/control</controlURL><eventSubURL>/cm/event</eventSubURL></service>')
+    [void]$b.Append('</serviceList>')
+    [void]$b.Append('</device></root>')
+    return $b.ToString()
+}
+
+$CdsScpd = '<?xml version="1.0" encoding="utf-8"?><scpd xmlns="urn:schemas-upnp-org:service-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><actionList><action><name>Browse</name><argumentList><argument><name>ObjectID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable></argument><argument><name>BrowseFlag</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_BrowseFlag</relatedStateVariable></argument><argument><name>Filter</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable></argument><argument><name>StartingIndex</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable></argument><argument><name>RequestedCount</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument><argument><name>SortCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable></argument><argument><name>Result</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable></argument><argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument><argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument><argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument></argumentList></action></actionList><serviceStateTable><stateVariable sendEvents="yes"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable><stateVariable sendEvents="no"><name>A_ARG_TYPE_ObjectID</name><dataType>string</dataType></stateVariable><stateVariable sendEvents="no"><name>A_ARG_TYPE_BrowseFlag</name><dataType>string</dataType></stateVariable><stateVariable sendEvents="no"><name>A_ARG_TYPE_Result</name><dataType>string</dataType></stateVariable></serviceStateTable></scpd>'
+$CmScpd = '<?xml version="1.0" encoding="utf-8"?><scpd xmlns="urn:schemas-upnp-org:service-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><actionList><action><name>GetProtocolInfo</name><argumentList><argument><name>Sink</name><direction>out</direction><relatedStateVariable>SinkProtocolInfo</relatedStateVariable></argument><argument><name>Source</name><direction>out</direction><relatedStateVariable>SourceProtocolInfo</relatedStateVariable></argument></argumentList></action></actionList><serviceStateTable><stateVariable sendEvents="yes"><name>SourceProtocolInfo</name><dataType>string</dataType></stateVariable><stateVariable sendEvents="yes"><name>SinkProtocolInfo</name><dataType>string</dataType></stateVariable></serviceStateTable></scpd>'
+
+function Reply([object]$Res, [int]$Code, [string]$Ct, [string]$Body, [int]$Len) {
+    $Res.StatusCode = $Code
+    $Res.ContentType = $Ct
+    $Res.ContentLength64 = $Len
+    try { $Res.Headers.Add('EXT', '') } catch { }
+    if ($Body) {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
+        $Res.ContentLength64 = $bytes.Length
+        $Res.OutputStream.Write($bytes, 0, $bytes.Length)
+    }
+    try { $Res.OutputStream.Close() } catch { }
+}
+
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add('http://+:' + $state.Port + '/')
+try {
+    $listener.Start()
+} catch {
+    $state.LastError = 'listener: ' + $_.Exception.ToString()
+    return
+}
+# 把监听器放进共享状态：停止时要主动 Close 解除 GetContext 阻塞
+$state.Listener = $listener
+$state.Ready = $true
+
+while (-not $state.Stop) {
+    $ctx = $null
+    try { $ctx = $listener.GetContext() } catch { break }
+    try {
+        $req = $ctx.Request
+        $res = $ctx.Response
+        $p = $req.Url.AbsolutePath
+        if ($p -eq '/desc.xml') {
+            Reply $res 200 'text/xml; charset="utf-8"' (DeviceXml) 0
+        }
+        elseif ($p -eq '/cds.xml') {
+            Reply $res 200 'text/xml; charset="utf-8"' $CdsScpd 0
+        }
+        elseif ($p -eq '/cm.xml') {
+            Reply $res 200 'text/xml; charset="utf-8"' $CmScpd 0
+        }
+        elseif ($p -eq '/cds/control' -and $req.HttpMethod -eq 'POST') {
+            $sr = New-Object IO.StreamReader($req.InputStream)
+            $body = $sr.ReadToEnd(); $sr.Close()
+            if ($body -match 'GetSortCapabilities') {
+                Reply $res 200 'text/xml; charset="utf-8"' '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetSortCapabilitiesResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><SortCaps></SortCaps></u:GetSortCapabilitiesResponse></s:Body></s:Envelope>' 0
+            } elseif ($body -match 'GetSearchCapabilities') {
+                Reply $res 200 'text/xml; charset="utf-8"' '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetSearchCapabilitiesResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><SearchCaps></SearchCaps></u:GetSearchCapabilitiesResponse></s:Body></s:Envelope>' 0
+            } elseif ($body -match 'GetSystemUpdateID') {
+                Reply $res 200 'text/xml; charset="utf-8"' '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetSystemUpdateIDResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><Id>1</Id></u:GetSystemUpdateIDResponse></s:Body></s:Envelope>' 0
+            } else {
+                Reply $res 200 'text/xml; charset="utf-8"' (SoapBrowse $body) 0
+            }
+        }
+        elseif ($p -eq '/cm/control' -and $req.HttpMethod -eq 'POST') {
+            Reply $res 200 'text/xml; charset="utf-8"' '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1"><Source>http-get:*:*:*</Source><Sink></Sink></u:GetProtocolInfoResponse></s:Body></s:Envelope>' 0
+        }
+        elseif (($p -eq '/cds/event' -or $p -eq '/cm/event')) {
+            try {
+                $res.StatusCode = 200
+                $res.Headers.Add('SID', 'uuid:' + $state.Uuid + '-sub')
+                $res.Headers.Add('TIMEOUT', 'Second-1800')
+                $res.ContentLength64 = 0
+            } catch { }
+            try { $res.OutputStream.Close() } catch { }
+        }
+        elseif ($p -eq '/health') {
+            Reply $res 200 'text/plain' 'ok' 0
+        }
+        elseif ($p.StartsWith('/media/')) {
+            $rel = [Uri]::UnescapeDataString($p.Substring('/media/'.Length))
+            $i = $rel.IndexOf('/')
+            if ($i -le 0) { Reply $res 404 'text/plain' 'not found' 0; continue }
+            $alias = $rel.Substring(0, $i)
+            $sub = $rel.Substring($i + 1).Replace('/', '\')
+            $full = $null
+            foreach ($s in $state.Shares) {
+                if ($s.Alias -eq $alias) { $full = Join-Path $s.Path $sub; break }
+            }
+            if (-not $full -or -not ([IO.File]::Exists($full))) {
+                Reply $res 404 'text/plain' 'not found' 0
+                continue
+            }
+            $ext = [IO.Path]::GetExtension($full).TrimStart('.').ToLower()
+            $mime = Get-Mime $ext
+            try {
+                $fs = [IO.File]::Open($full, 'Open', 'Read', 'Read')
+            } catch {
+                Reply $res 500 'text/plain' 'locked' 0
+                continue
+            }
+            $start = [long]0; $end = [long]($fs.Length - 1); $code = 200
+            $rng = $req.Headers['Range']
+            if ($rng -and $rng -match 'bytes=(\d*)-(\d*)') {
+                if ($Matches[1] -ne '') { $start = [long]$Matches[1] }
+                if ($Matches[2] -ne '') { $end = [long]$Matches[2] }
+                if ($end -ge $fs.Length) { $end = $fs.Length - 1 }
+                $code = 206
+            }
+            if ($start -gt $end) { $fs.Close(); Reply $res 416 'text/plain' 'range' 0; continue }
+            $len = $end - $start + 1
+            $res.StatusCode = $code
+            $res.ContentType = $mime
+            $res.ContentLength64 = $len
+            try { $res.Headers.Add('Accept-Ranges', 'bytes') } catch { }
+            if ($code -eq 206) {
+                try { $res.Headers.Add('Content-Range', 'bytes ' + $start + '-' + $end + '/' + $fs.Length) } catch { }
+            }
+            if ($req.HttpMethod -eq 'HEAD') {
+                try { $res.OutputStream.Close() } catch { }
+                $fs.Close()
+                continue
+            }
+            [void]$fs.Seek($start, 'Begin')
+            $buf = New-Object byte[] 65536
+            $sent = [long]0
+            try {
+                while ($sent -lt $len -and -not $state.Stop) {
+                    $n = $fs.Read($buf, 0, [int][Math]::Min(65536, $len - $sent))
+                    if ($n -le 0) { break }
+                    $res.OutputStream.Write($buf, 0, $n)
+                    $sent += $n
+                }
+            } catch { }
+            try { $res.OutputStream.Close() } catch { }
+            $fs.Close()
+        }
+        else {
+            Reply $res 404 'text/plain' 'not found' 0
+        }
+    } catch { }
+    finally {
+        try { if ($ctx) { $ctx.Response.OutputStream.Close() } } catch { }
+    }
+}
+try { $listener.Close() } catch { }
+$state.Ready = $false
+'@
+
+$script:DlnaSsdpWorker = @'
+param($state)
+$ErrorActionPreference = 'Continue'
+
+function Send-Usn([System.Net.Sockets.UdpClient]$u, [string]$epHost, [int]$epPort, [string]$nt, [string]$usn, [string]$nts) {
+    $pkt = "NOTIFY * HTTP/1.1`r`n" +
+           "HOST: 239.255.255.250:1900`r`n" +
+           "CACHE-CONTROL: max-age=1800`r`n" +
+           "LOCATION: http://$($state.Ip):$($state.Port)/desc.xml`r`n" +
+           "NT: $nt`r`n" +
+           "NTS: $nts`r`n" +
+           "SERVER: Windows/10 UPnP/1.0 WinShareManager`r`n" +
+           "USN: $usn`r`n`r`n"
+    $b = [Text.Encoding]::ASCII.GetBytes($pkt)
+    try { [void]$u.Send($b, $b.Length, $epHost, $epPort) } catch { }
+}
+
+$usns = @(
+    @{ NT = 'upnp:rootdevice';                                          USN = ('uuid:' + $state.Uuid + '::upnp:rootdevice') },
+    @{ NT = ('uuid:' + $state.Uuid);                                     USN = ('uuid:' + $state.Uuid) },
+    @{ NT = 'urn:schemas-upnp-org:device:MediaServer:1';                 USN = ('uuid:' + $state.Uuid + '::urn:schemas-upnp-org:device:MediaServer:1') },
+    @{ NT = 'urn:schemas-upnp-org:service:ContentDirectory:1';           USN = ('uuid:' + $state.Uuid + '::urn:schemas-upnp-org:service:ContentDirectory:1') },
+    @{ NT = 'urn:schemas-upnp-org:service:ConnectionManager:1';          USN = ('uuid:' + $state.Uuid + '::urn:schemas-upnp-org:service:ConnectionManager:1') }
+)
+
+$udp = New-Object System.Net.Sockets.UdpClient
+$udp.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+$udp.Client.Bind((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 1900)))
+try { $udp.JoinMulticastGroup([System.Net.IPAddress]'239.255.255.250') } catch { }
+$state.SsdpUdp = $udp
+$state.SsdpReady = $true
+
+while (-not $state.Stop) {
+    $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+    $bytes = $null
+    try { $bytes = $udp.Receive([ref]$ep) } catch { break }
+    $txt = [Text.Encoding]::ASCII.GetString($bytes)
+    if ($txt -notmatch 'M-SEARCH' -or $txt -notmatch 'ssdp:discover') { continue }
+    $st = ''
+    foreach ($line in ($txt -split "`r`n")) {
+        if ($line -match '^ST:\s*(.+)$') { $st = $Matches[1].Trim(); break }
+    }
+    if (-not $st) { continue }
+    $targets = @()
+    if ($st -eq 'ssdp:all') { $targets = $usns }
+    else { foreach ($u in $usns) { if ($u.NT -eq $st) { $targets = @($u) } } }
+    foreach ($t in $targets) {
+        $resp = "HTTP/1.1 200 OK`r`n" +
+                "CACHE-CONTROL: max-age=1800`r`n" +
+                "EXT:`r`n" +
+                "LOCATION: http://$($state.Ip):$($state.Port)/desc.xml`r`n" +
+                "SERVER: Windows/10 UPnP/1.0 WinShareManager`r`n" +
+                "ST: $($t.NT)`r`n" +
+                "USN: $($t.USN)`r`n`r`n"
+        $b = [Text.Encoding]::ASCII.GetBytes($resp)
+        try { [void]$udp.Send($b, $b.Length, $ep.Address.ToString(), $ep.Port) } catch { }
+        Start-Sleep -Milliseconds 30
+    }
+}
+try { $udp.Close() } catch { }
+'@
+
+$script:DlnaNotifyWorker = @'
+param($state)
+$ErrorActionPreference = 'Continue'
+
+function Send-Alive([System.Net.Sockets.UdpClient]$u, [string]$nt, [string]$usn) {
+    $pkt = "NOTIFY * HTTP/1.1`r`n" +
+           "HOST: 239.255.255.250:1900`r`n" +
+           "CACHE-CONTROL: max-age=1800`r`n" +
+           "LOCATION: http://$($state.Ip):$($state.Port)/desc.xml`r`n" +
+           "NT: $nt`r`n" +
+           "NTS: ssdp:alive`r`n" +
+           "SERVER: Windows/10 UPnP/1.0 WinShareManager`r`n" +
+           "USN: $usn`r`n`r`n"
+    $b = [Text.Encoding]::ASCII.GetBytes($pkt)
+    try { [void]$u.Send($b, $b.Length, '239.255.255.250', 1900) } catch { }
+}
+
+$usns = @(
+    @{ NT = 'upnp:rootdevice';                                 USN = ('uuid:' + $state.Uuid + '::upnp:rootdevice') },
+    @{ NT = ('uuid:' + $state.Uuid);                            USN = ('uuid:' + $state.Uuid) },
+    @{ NT = 'urn:schemas-upnp-org:device:MediaServer:1';        USN = ('uuid:' + $state.Uuid + '::urn:schemas-upnp-org:device:MediaServer:1') },
+    @{ NT = 'urn:schemas-upnp-org:service:ContentDirectory:1';  USN = ('uuid:' + $state.Uuid + '::urn:schemas-upnp-org:service:ContentDirectory:1') },
+    @{ NT = 'urn:schemas-upnp-org:service:ConnectionManager:1'; USN = ('uuid:' + $state.Uuid + '::urn:schemas-upnp-org:service:ConnectionManager:1') }
+)
+
+$udp = New-Object System.Net.Sockets.UdpClient
+# 启动时连发三波 alive，保证刚开机 / 刚启动的渲染设备能马上看到
+for ($round = 0; $round -lt 3; $round++) {
+    if ($state.Stop) { break }
+    foreach ($u in $usns) { Send-Alive $u $u.NT $u.USN }
+    Start-Sleep -Milliseconds 400
+}
+
+while (-not $state.Stop) {
+    for ($i = 0; $i -lt 30 -and -not $state.Stop; $i++) { Start-Sleep -Seconds 1 }
+    if ($state.Stop) { break }
+    foreach ($u in $usns) { Send-Alive $u $u.NT $u.USN }
+}
+
+# byebye
+foreach ($u in $usns) {
+    $pkt = "NOTIFY * HTTP/1.1`r`n" +
+           "HOST: 239.255.255.250:1900`r`n" +
+           "NT: $($u.NT)`r`n" +
+           "NTS: ssdp:byebye`r`n" +
+           "USN: $($u.USN)`r`n`r`n"
+    $b = [Text.Encoding]::ASCII.GetBytes($pkt)
+    try { [void]$udp.Send($b, $b.Length, '239.255.255.250', 1900) } catch { }
+}
+try { $udp.Close() } catch { }
+'@
+
+function Start-DlnaServer {
+    $st = $script:Dlna
+    if ($st.Running) { return $true }
+    $cfg  = Get-Config
+    $port = Get-DlnaPort
+    $shares = @(Get-ShareList | Where-Object { $_.Protocols -contains 'DLNA' })
+    if ($shares.Count -eq 0) {
+        Write-Op '没有勾选 DLNA 的共享：先在「新增共享」或共享属性里勾选 DLNA。' 'ERR'
+        return $false
+    }
+    $ip = Get-LanIPv4
+    if (-not $ip) {
+        Write-Op '找不到局域网 IPv4 地址，DLNA 无法启动。' 'ERR'
+        return $false
+    }
+
+    # 防火墙放行（幂等）
+    foreach ($r in @(@{ N = 'WinShareManager-DLNA-TCP'; P = $port; Proto = 'TCP' },
+                     @{ N = 'WinShareManager-DLNA-SSDP'; P = 1900;  Proto = 'UDP' })) {
+        try {
+            if (-not (Get-NetFirewallRule -DisplayName $r.N -ErrorAction SilentlyContinue)) {
+                New-NetFirewallRule -DisplayName $r.N -Direction Inbound -Action Allow `
+                    -Protocol $r.Proto -LocalPort $r.P -ErrorAction Stop | Out-Null
+                Write-Op "防火墙已放行 $($r.Proto) $($r.P)（$($r.N)）。" 'OK'
+            }
+        } catch {
+            Write-Op "防火墙规则 $($r.N) 失败：$($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    $items = @()
+    foreach ($s in $shares) {
+        $items += @{ Alias = (Get-FtpAlias -Name $s.Name); Name = $s.Name; Path = $s.Path }
+    }
+
+    $state = [hashtable]::Synchronized(@{
+        Port     = $port
+        Ip       = $ip
+        Uuid     = (Get-DlnaUuid)
+        Friendly = "WinShareManager ($env:COMPUTERNAME)"
+        Shares   = $items
+        Stop     = $false
+        Ready    = $false
+        SsdpReady= $false
+        LastError= ''
+    })
+
+    function Start-Worker([string]$Script, $Arg) {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = 'MTA'
+        $rs.ThreadOptions  = 'UseNewThread'
+        $rs.Open()
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript($Script).AddArgument($Arg)
+        [void]$ps.BeginInvoke()
+        return @{ Ps = $ps; Rs = $rs }
+    }
+
+    $st.State   = $state
+    $st.HttpPs  = $null; $st.HttpRs = $null
+    $st.SsdpPs  = $null; $st.SsdpRs = $null
+    $st.NotifyPs = $null; $st.NotifyRs = $null
+
+    try {
+        $w = Start-Worker $script:DlnaHttpWorker $state
+        $st.HttpPs = $w.Ps; $st.HttpRs = $w.Rs
+        $w2 = Start-Worker $script:DlnaSsdpWorker $state
+        $st.SsdpPs = $w2.Ps; $st.SsdpRs = $w2.Rs
+        $w3 = Start-Worker $script:DlnaNotifyWorker $state
+        $st.NotifyPs = $w3.Ps; $st.NotifyRs = $w3.Rs
+    } catch {
+        Write-Op "DLNA 服务启动失败：$($_.Exception.Message)" 'ERR'
+        Stop-DlnaServer | Out-Null
+        return $false
+    }
+
+    # 等 HTTP 监听就绪（最多 3 秒）
+    for ($i = 0; $i -lt 30 -and -not $state.Ready -and -not $state.LastError; $i++) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $state.Ready) {
+        Write-Op "DLNA 服务启动失败：$($state.LastError)（端口被占用？换一个 DLNA 端口或重启程序再试）" 'ERR'
+        Stop-DlnaServer | Out-Null
+        return $false
+    }
+
+    $st.Running = $true
+    Write-Op "DLNA 媒体服务器已启动：http://$ip`:$port · 名称「$($state.Friendly)」 · 共享 $($items.Count) 个" 'OK'
+    Write-Op 'DLNA 不支持账号密码：勾选 DLNA 的目录对整个局域网可读，请注意内网环境。' 'WARN'
+    return $true
+}
+
+function Stop-DlnaServer {
+    $st = $script:Dlna
+    if (-not $st.Running -and -not $st.State) { return $true }
+    if ($st.State) {
+        $st.State.Stop = $true
+        try { $st.State.Ready = $false } catch { }
+        # 主动关掉阻塞中的套接字，worker 的 GetContext / Receive 会抛异常退出
+        try { if ($st.State.Listener) { $st.State.Listener.Stop(); $st.State.Listener.Close() } } catch { }
+        try { if ($st.State.SsdpUdp)  { $st.State.SsdpUdp.Close() } } catch { }
+    }
+    foreach ($w in @('HttpPs', 'SsdpPs', 'NotifyPs')) {
+        try {
+            if ($st[$w]) { $st[$w].Stop(); $st[$w].Dispose() }
+        } catch { }
+        $st[$w] = $null
+    }
+    foreach ($r in @('HttpRs', 'SsdpRs', 'NotifyRs')) {
+        try {
+            if ($st[$r]) { $st[$r].Close(); $st[$r].Dispose() }
+        } catch { }
+        $st[$r] = $null
+    }
+    $st.State = $null
+    $st.Running = $false
+    Write-Op 'DLNA 媒体服务器已停止。' 'OK'
+    return $true
+}
+
+function Restart-DlnaServer {
+    $st = $script:Dlna
+    if ($st.Running) {
+        Stop-DlnaServer | Out-Null
+        return (Start-DlnaServer)
+    }
+    return $true
 }
 
 function Install-Protocol {
@@ -1206,6 +1887,10 @@ function Install-Protocol {
         'SFTP' {
             Write-Op '——— 安装 SFTP 所需组件 ———' 'INFO'
             return [bool](Install-Plugin -Key 'OPENSSH')
+        }
+        'DLNA' {
+            Write-Op 'DLNA 由程序内置实现（SSDP + HTTP），无需安装任何组件。' 'OK'
+            return $true
         }
         default {
             Write-Op "未知协议：$Key" 'ERR'
@@ -1258,6 +1943,9 @@ function Start-Protocol {
                 Write-Op 'SFTP（sshd）已启动。' 'OK'
                 return $true
             }
+            'DLNA' {
+                return (Start-DlnaServer)
+            }
             default { return $false }
         }
     } catch {
@@ -1301,6 +1989,9 @@ function Stop-Protocol {
                 Stop-Service sshd -Force -ErrorAction Stop
                 Write-Op 'SFTP（sshd）已停止。' 'OK'
                 return $true
+            }
+            'DLNA' {
+                return (Stop-DlnaServer)
             }
             default { return $false }
         }
@@ -1947,7 +2638,7 @@ function Build-StandaloneExe {
         [System.IO.File]::WriteAllText($tempFile, $merged, $utf8bom)
         Write-Op "已合并为单文件脚本（$([math]::Round((Get-Item $tempFile).Length/1KB,1)) KB）。" 'INFO'
 
-        $outExe = Join-Path $OutputDir 'WinShareManager.exe'
+        $outExe = Join-Path $OutputDir ("WinShareManager_v" + $script:AppVersion + ".exe")
         Invoke-PS2EXE -InputFile $tempFile `
                       -OutputFile $outExe `
                       -NoConsole `

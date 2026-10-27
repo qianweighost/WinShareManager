@@ -1,6 +1,6 @@
 # WinShareManager
 
-[![version](https://img.shields.io/badge/version-2.0.2-2f7bf6)](https://github.com/qianweighost/WinShareManager/releases/latest)
+[![version](https://img.shields.io/badge/version-2.1.0-2f7bf6)](https://github.com/qianweighost/WinShareManager/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-34a84a)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-8e8e93)](#)
 [![release](https://img.shields.io/github/v/release/qianweighost/WinShareManager?label=release&color=f5a623)](https://github.com/qianweighost/WinShareManager/releases/latest)
@@ -11,7 +11,7 @@ Windows 上的原生共享协议统一管理台。一个界面管理 **SMB / Web
 
 ## 下载
 
-到 [Releases](https://github.com/qianweighost/WinShareManager/releases/latest) 下载 `WinShareManager.exe`，**单文件、双击即用**，不需要安装、不需要 .NET SDK、不联网。
+到 [Releases](https://github.com/qianweighost/WinShareManager/releases/latest) 下载 `WinShareManager_v<版本号>.exe`，**单文件、双击即用**，不需要安装、不需要 .NET SDK、不联网。
 
 - 体积约 310 KB，全部代码与图标内嵌
 - 启动会请求管理员权限（UAC），这是修改共享 / 服务 / 防火墙所必需的
@@ -60,7 +60,7 @@ Windows 上的原生共享协议统一管理台。一个界面管理 **SMB / Web
 
 | 文件 | 作用 |
 |---|---|
-| **`WinShareManager.exe`** | **真·单文件程序，双击即用**（约 308 KB，全部代码 + 图标内嵌，清单里直接请求管理员权限，无控制台黑框，标题栏 / 任务栏 / Alt-Tab 三处图标一致） |
+| **`WinShareManager_v<版本号>.exe`** | **真·单文件程序，双击即用**（全部代码 + 图标内嵌，清单里直接请求管理员权限，无控制台黑框，标题栏 / 任务栏 / Alt-Tab 三处图标一致） |
 
 `WinShareManager.exe` 不依赖任何外部文件、不联网、不解压到临时目录，拷到任何 Windows 10/11 机器上双击就能跑。
 
