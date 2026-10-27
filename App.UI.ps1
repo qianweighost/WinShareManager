@@ -715,6 +715,145 @@ function New-Badge {
 
 # ---- 链接图标（仓库入口：不放明文地址，画一个链环，点一下打开浏览器）----
 # 颜色一律塞进 Tag：事件处理器的执行作用域拿不到定义处的局部变量。
+# GitHub 官方标志（mark-github，octocat 剪影，viewBox 0 0 16 16）
+$script:GithubMarkD = 'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.06-1.86 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z'
+
+# 把 SVG path 数据转成 GDI+ GraphicsPath（支持 M C S L H V A Z 及其小写相对形式）。
+# 数字解析按 SVG 规范：".4.07" = 0.4 和 0.07 两个数。
+function Convert-SvgPathToGraphicsPath {
+    param([Parameter(Mandatory = $true)][string]$D)
+
+    $path   = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $tokens = @([regex]::Matches($D, '[MmZzLlHhVvCcSsQqTtAa]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?') |
+                ForEach-Object { $_.Value })
+    $n   = $tokens.Count
+    $idx = 0
+    $cx = [double]0; $cy = [double]0; $sx = [double]0; $sy = [double]0
+    $lx = [double]0; $ly = [double]0
+    $cmd = ''
+
+    while ($idx -lt $n) {
+        if ($tokens[$idx] -match '^[A-Za-z]$') { $cmd = $tokens[$idx]; $idx++ }
+        if ($cmd -in @('Z', 'z')) { $path.CloseFigure(); $cx = $sx; $cy = $sy; continue }
+
+        $arity = switch -CaseSensitive ($cmd) {
+            'M' { 2 } 'm' { 2 } 'L' { 2 } 'l' { 2 }
+            'H' { 1 } 'h' { 1 } 'V' { 1 } 'v' { 1 }
+            'C' { 6 } 'c' { 6 } 'S' { 4 } 's' { 4 }
+            'Q' { 4 } 'q' { 4 } 'T' { 2 } 't' { 2 }
+            'A' { 7 } 'a' { 7 }
+            default { 0 }
+        }
+        $vals = @()
+        for ($k = 0; $k -lt $arity -and $idx -lt $n; $k++) {
+            if ($tokens[$idx] -match '^[A-Za-z]$') { break }
+            $vals += [double]$tokens[$idx]; $idx++
+        }
+        if ($vals.Count -lt $arity) { break }
+
+        switch -CaseSensitive ($cmd) {
+            'M' { $cx = $vals[0]; $cy = $vals[1]; $sx = $cx; $sy = $cy; $path.StartFigure(); $cmd = 'L' }
+            'm' { $cx += $vals[0]; $cy += $vals[1]; $sx = $cx; $sy = $cy; $path.StartFigure(); $cmd = 'l' }
+            'L' { $path.AddLine([single]$cx, [single]$cy, [single]$vals[0], [single]$vals[1]); $cx = $vals[0]; $cy = $vals[1] }
+            'l' { $nx = $cx + $vals[0]; $ny = $cy + $vals[1]; $path.AddLine([single]$cx, [single]$cy, [single]$nx, [single]$ny); $cx = $nx; $cy = $ny }
+            'H' { $path.AddLine([single]$cx, [single]$cy, [single]$vals[0], [single]$cy); $cx = $vals[0] }
+            'h' { $nx = $cx + $vals[0]; $path.AddLine([single]$cx, [single]$cy, [single]$nx, [single]$cy); $cx = $nx }
+            'V' { $path.AddLine([single]$cx, [single]$cy, [single]$cx, [single]$vals[0]); $cy = $vals[0] }
+            'v' { $ny = $cy + $vals[0]; $path.AddLine([single]$cx, [single]$cy, [single]$cx, [single]$ny); $cy = $ny }
+            'C' {
+                $path.AddBezier([single]$cx, [single]$cy, [single]$vals[0], [single]$vals[1], [single]$vals[2], [single]$vals[3], [single]$vals[4], [single]$vals[5])
+                $lx = $vals[2]; $ly = $vals[3]; $cx = $vals[4]; $cy = $vals[5]
+            }
+            'c' {
+                $c1x = $cx + $vals[0]; $c1y = $cy + $vals[1]
+                $c2x = $cx + $vals[2]; $c2y = $cy + $vals[3]
+                $ex  = $cx + $vals[4]; $ey  = $cy + $vals[5]
+                $path.AddBezier([single]$cx, [single]$cy, [single]$c1x, [single]$c1y, [single]$c2x, [single]$c2y, [single]$ex, [single]$ey)
+                $lx = $c2x; $ly = $c2y; $cx = $ex; $cy = $ey
+            }
+            'S' {
+                $c1x = 2 * $cx - $lx; $c1y = 2 * $cy - $ly
+                $c2x = $vals[0]; $c2y = $vals[1]
+                $path.AddBezier([single]$cx, [single]$cy, [single]$c1x, [single]$c1y, [single]$c2x, [single]$c2y, [single]$vals[2], [single]$vals[3])
+                $lx = $c2x; $ly = $c2y; $cx = $vals[2]; $cy = $vals[3]
+            }
+            's' {
+                $c1x = 2 * $cx - $lx; $c1y = 2 * $cy - $ly
+                $c2x = $cx + $vals[0]; $c2y = $cy + $vals[1]
+                $ex  = $cx + $vals[2]; $ey  = $cy + $vals[3]
+                $path.AddBezier([single]$cx, [single]$cy, [single]$c1x, [single]$c1y, [single]$c2x, [single]$c2y, [single]$ex, [single]$ey)
+                $lx = $c2x; $ly = $c2y; $cx = $ex; $cy = $ey
+            }
+            'Q' {
+                # 二次贝塞尔升阶成三次
+                $c1x = $cx + 2.0 / 3.0 * ($vals[0] - $cx); $c1y = $cy + 2.0 / 3.0 * ($vals[1] - $cy)
+                $c2x = $vals[2] + 2.0 / 3.0 * ($vals[0] - $vals[2]); $c2y = $vals[3] + 2.0 / 3.0 * ($vals[1] - $vals[3])
+                $path.AddBezier([single]$cx, [single]$cy, [single]$c1x, [single]$c1y, [single]$c2x, [single]$c2y, [single]$vals[2], [single]$vals[3])
+                $lx = $vals[0]; $ly = $vals[1]; $cx = $vals[2]; $cy = $vals[3]
+            }
+            'A' {
+                $x1 = $cx; $y1 = $cy
+                $rx = [Math]::Abs($vals[0]); $ry = [Math]::Abs($vals[1])
+                $phi = $vals[2] * [Math]::PI / 180.0
+                $x2 = $vals[5]; $y2 = $vals[6]
+                if ($rx -eq 0 -or $ry -eq 0) {
+                    $path.AddLine([single]$x1, [single]$y1, [single]$x2, [single]$y2)
+                } else {
+                    $cosP = [Math]::Cos($phi); $sinP = [Math]::Sin($phi)
+                    $dx2 = ($x1 - $x2) / 2.0; $dy2 = ($y1 - $y2) / 2.0
+                    $X1p =  $cosP * $dx2 + $sinP * $dy2
+                    $Y1p = -$sinP * $dx2 + $cosP * $dy2
+                    $lam = ($X1p / $rx) * ($X1p / $rx) + ($Y1p / $ry) * ($Y1p / $ry)
+                    if ($lam -gt 1) {
+                        $s = [Math]::Sqrt($lam); $rx *= $s; $ry *= $s
+                    }
+                    $sign = 1.0; if ($vals[3] -eq $vals[4]) { $sign = -1.0 }
+                    $num = $rx * $rx * $ry * $ry - $rx * $rx * $Y1p * $Y1p - $ry * $ry * $X1p * $X1p
+                    $den = $rx * $rx * $Y1p * $Y1p + $ry * $ry * $X1p * $X1p
+                    $co = $sign * [Math]::Sqrt([Math]::Max(0.0, $num / $den))
+                    $Cxp =  $co *  $rx * $Y1p / $ry
+                    $Cyp = -$co *  $ry * $X1p / $rx
+                    $ccx = $cosP * $Cxp - $sinP * $Cyp + ($x1 + $x2) / 2.0
+                    $ccy = $sinP * $Cxp + $cosP * $Cyp + ($y1 + $y2) / 2.0
+
+                    $ux = ($X1p - $Cxp) / $rx; $uy = ($Y1p - $Cyp) / $ry
+                    $vx = (-$X1p - $Cxp) / $rx; $vy = (-$Y1p - $Cyp) / $ry
+                    $t1 = [Math]::Acos([Math]::Max(-1.0, [Math]::Min(1.0, $ux / [Math]::Sqrt($ux * $ux + $uy * $uy))))
+                    if ($uy -lt 0) { $t1 = -$t1 }
+                    $dt = [Math]::Acos([Math]::Max(-1.0, [Math]::Min(1.0, ($ux * $vx + $uy * $vy) /
+                               ([Math]::Sqrt($ux * $ux + $uy * $uy) * [Math]::Sqrt($vx * $vx + $vy * $vy)))))
+                    if ($ux * $vy - $uy * $vx -lt 0) { $dt = -$dt }
+                    if ($vals[4] -eq 0 -and $dt -gt 0) { $dt -= 2 * [Math]::PI }
+                    if ($vals[4] -eq 1 -and $dt -lt 0) { $dt += 2 * [Math]::PI }
+
+                    $seg = [Math]::Ceiling([Math]::Abs($dt) / ([Math]::PI / 2.0))
+                    $delta = $dt / $seg
+                    $kappa = 4.0 / 3.0 * [Math]::Tan($delta / 4.0)
+                    for ($k = 0; $k -lt $seg; $k++) {
+                        $a1 = $t1 + $delta * $k
+                        $a2 = $a1 + $delta
+                        $p0x = $ccx + $rx * [Math]::Cos($a1) * $cosP - $ry * [Math]::Sin($a1) * $sinP
+                        $p0y = $ccy + $rx * [Math]::Cos($a1) * $sinP + $ry * [Math]::Sin($a1) * $cosP
+                        $p3x = $ccx + $rx * [Math]::Cos($a2) * $cosP - $ry * [Math]::Sin($a2) * $sinP
+                        $p3y = $ccy + $rx * [Math]::Cos($a2) * $sinP + $ry * [Math]::Sin($a2) * $cosP
+                        $d0x = -$rx * [Math]::Sin($a1) * $cosP - $ry * [Math]::Cos($a1) * $sinP
+                        $d0y = -$rx * [Math]::Sin($a1) * $sinP + $ry * [Math]::Cos($a1) * $cosP
+                        $d3x = -$rx * [Math]::Sin($a2) * $cosP - $ry * [Math]::Cos($a2) * $sinP
+                        $d3y = -$rx * [Math]::Sin($a2) * $sinP + $ry * [Math]::Cos($a2) * $cosP
+                        $path.AddBezier(
+                            [single]$p0x, [single]$p0y,
+                            [single]($p0x + $kappa * $d0x), [single]($p0y + $kappa * $d0y),
+                            [single]($p3x - $kappa * $d3x), [single]($p3y - $kappa * $d3y),
+                            [single]$p3x, [single]$p3y)
+                    }
+                }
+                $cx = $x2; $cy = $y2
+            }
+        }
+    }
+    return $path
+}
+
 function New-LinkIcon {
     param([string]$Url = '', [string]$Tip = '', [int]$Size = 24)
 
@@ -744,27 +883,22 @@ function New-LinkIcon {
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $g.Clear($s.BackColor)
 
-        $st   = $s.Tag
-        $col  = if ($st.Hover) { $st.ColorHover } else { $st.Color }
-        $pen  = New-Object System.Drawing.Pen($col, [single]1.7)
-        $cx   = $s.Width  / 2.0
-        $cy   = $s.Height / 2.0
-        $w    = [int][Math]::Round($s.Width  * 0.52)
-        $h    = [int][Math]::Round($s.Height * 0.30)
-        $r    = [int][Math]::Floor($h / 2)
-        $off  = [single]($s.Width * 0.13)
+        $st  = $s.Tag
+        $col = if ($st.Hover) { $st.ColorHover } else { $st.Color }
 
-        # 两个倾斜 45° 的圆角矩形扣在一起 = 链环
-        foreach ($dx in @(-$off, $off)) {
-            $gr = $g.Save()
-            $g.TranslateTransform([single]($cx + $dx), [single]$cy)
-            $g.RotateTransform(45)
-            $path = Get-RoundRect -X ([int](-$w / 2)) -Y ([int](-$h / 2)) -W $w -H $h -R $r
-            $g.DrawPath($pen, $path)
-            $path.Dispose()
-            $g.Restore($gr)
+        # GitHub octocat 标志剪影（16x16 路径缓存，绘制时缩放铺满控件）
+        if (-not $script:GhMarkPath) {
+            $script:GhMarkPath = Convert-SvgPathToGraphicsPath -D $script:GithubMarkD
         }
-        $pen.Dispose()
+        $scale = [single]($s.Width / 16.0)
+        $gs = $g.Save()
+        $g.TranslateTransform([single](($s.Width  - 16.0 * $scale) / 2.0),
+                              [single](($s.Height - 16.0 * $scale) / 2.0))
+        $g.ScaleTransform($scale, $scale)
+        $brush = New-Object System.Drawing.SolidBrush($col)
+        $g.FillPath($brush, $script:GhMarkPath)
+        $brush.Dispose()
+        $g.Restore($gs)
     })
 
     $p.Add_MouseEnter({ param($s, $e) $s.Tag.Hover = $true;  $s.Invalidate() })
@@ -1509,7 +1643,10 @@ function Refresh-ShareView {
                     $ok   = [bool]$running['WebDAV']
                 }
                 'FTP' {
-                    $link = "ftp://$env:COMPUTERNAME`:$($cfg.FtpPort)/$([Uri]::EscapeDataString($s.Name))"
+                    # FTP 目录别名一律 ASCII（中文别名会让资源管理器报 451），
+                    # 所以链接直接用别名，不再做 URL 编码
+                    $alias = Get-FtpAlias -Name $s.Name
+                    $link = "ftp://$env:COMPUTERNAME`:$($cfg.FtpPort)/$alias"
                     $ok   = [bool]$running['FTP']
                 }
                 'SFTP' {
@@ -2408,15 +2545,34 @@ $gridShare.Add_CellContentClick({
                 # sftp:// 没有系统级处理器；优先带起 GUI 客户端，
                 # 其次用 Windows 自带的 OpenSSH 命令行客户端开个控制台直连，
                 # 两者都没有才退回「复制路径 + 指引」。
+                # 登录用户必须显式指定——不指定的话 sftp.exe 默认拿当前
+                # Windows 账户（administrator）去连，而共享授权的往往不是它。
                 try { [System.Windows.Forms.Clipboard]::SetText($path) } catch { }
+
+                $sftpUser = ''
+                try {
+                    $sftpUser = [string](Get-SftpLastUser)
+                } catch { }
+                try {
+                    [void][Reflection.Assembly]::LoadWithPartialName('Microsoft.VisualBasic')
+                    $typed = [Microsoft.VisualBasic.Interaction]::InputBox(
+                        "SFTP 登录用户名（建议用共享授权的账号）：`r`n`r`n远程路径已复制到剪贴板：$path",
+                        'SFTP 登录用户', $sftpUser)
+                } catch { $typed = $sftpUser }
+                if ([string]::IsNullOrWhiteSpace($typed)) {
+                    Set-Status '已取消 SFTP 连接 · 远程路径仍在剪贴板'
+                    return
+                }
+                $sftpUser = $typed.Trim()
+                Set-SftpLastUser -User $sftpUser
 
                 $winscp = @("$env:ProgramFiles\WinSCP\WinSCP.exe",
                             "${env:ProgramFiles(x86)}\WinSCP\WinSCP.exe") |
                           Where-Object { Test-Path $_ } | Select-Object -First 1
                 if ($winscp) {
                     try {
-                        Start-Process -FilePath $winscp -ArgumentList "sftp://$env:COMPUTERNAME/"
-                        Set-Status "已启动 WinSCP 并指向本机 · 远程路径已复制：$path"
+                        Start-Process -FilePath $winscp -ArgumentList "sftp://${sftpUser}@$env:COMPUTERNAME/"
+                        Set-Status "已启动 WinSCP（用户 $sftpUser）· 远程路径已复制：$path"
                     } catch { Start-Process -FilePath $winscp }
                     return
                 }
@@ -2425,8 +2581,8 @@ $gridShare.Add_CellContentClick({
                              Where-Object { Test-Path $_ } | Select-Object -First 1
                 if ($filezilla) {
                     try {
-                        Start-Process -FilePath $filezilla -ArgumentList "sftp://$env:COMPUTERNAME"
-                        Set-Status "已启动 FileZilla · 远程路径已复制：$path"
+                        Start-Process -FilePath $filezilla -ArgumentList "sftp://${sftpUser}@$env:COMPUTERNAME"
+                        Set-Status "已启动 FileZilla（用户 $sftpUser）· 远程路径已复制：$path"
                     } catch { Start-Process -FilePath $filezilla }
                     return
                 }
@@ -2437,8 +2593,8 @@ $gridShare.Add_CellContentClick({
                 if ($sftpExe -and (Test-Path $sftpExe)) {
                     try {
                         Start-Process -FilePath "$env:windir\System32\cmd.exe" `
-                            -ArgumentList "/k", "`"$sftpExe`" $env:COMPUTERNAME"
-                        Set-Status "已打开命令行连接本机 SFTP（输入密码登录，cd 到共享目录）· 远程路径已复制：$path"
+                            -ArgumentList "/k", "`"$sftpExe`" ${sftpUser}@$env:COMPUTERNAME"
+                        Set-Status "已打开命令行以 $sftpUser 连接本机 SFTP（输入密码登录，cd 到共享目录）· 远程路径已复制：$path"
                     } catch {
                         [void][System.Windows.Forms.MessageBox]::Show(
                             "启动 sftp.exe 失败：$($_.Exception.Message)",

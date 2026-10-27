@@ -441,7 +441,10 @@ $env:WSM_DLG_SHOT='C:\temp\dlg'; $env:WSM_TASK_SHOT='C:\temp\task.png'
 |---|---|---|
 | WebDAV 访问报 405 | 未配置创作规则 | 程序已通过 appcmd 写入 `authoringRules` |
 | WebDAV 浏览器访问报 401.2（无登录框） | `IIS-BasicAuthentication` 功能未启用，401 响应不带 `WWW-Authenticate` 质询头 | v2.0.2 起 WebDAV 安装链自动启用 Basic/Windows 认证功能并确保站点挂上 `BasicAuthenticationModule` |
+| WebDAV 登录后报 403.14 | 浏览器「打开」是普通 GET，IIS 目录浏览默认关闭 | v2.0.2 起建站自动写入 `directoryBrowse enabled="true"` |
+| FTP 登录报 451（No mapping for the Unicode character） | 中文虚拟目录别名 + 资源管理器 FTP 客户端代码页转换失败；且 IIS FTP 根列表不显示虚拟目录 | v2.0.2 起 FTP 别名一律 ASCII 化（`ftp-<哈希>`），并在站点根下建 NTFS junction 让共享在列表里可见 |
 | FTP 登录报 534（策略要求 SSL） | 站点 `ssl` 默认 `SslRequire`；且部分机器 schema 缺 `basicAuthentication` 子节，`appcmd set config` 报「未知配置节」 | v2.0.2 起改用 `appcmd set site` 的 `ftpServer.*` 点路径设置：Basic 开、匿名关、`SslAllow` 放行明文通道 |
+| SFTP 打开默认连成 administrator | `sftp.exe 主机名` 不带用户时默认用当前 Windows 账户 | v2.0.2 起弹出用户名输入框（预填并记住上次账号），以 `用户名@主机` 连接 |
 | FTP 登录报 530 | 没有任何认证方式启用（默认 Basic/匿名都关） | 程序已启用 Basic 认证（用 Windows 本机账号登录） |
 | WebDAV 上传超过 30MB 失败 | requestFiltering 默认限制 | 程序已设为 4GB |
 | 资源管理器挂 WebDAV 报 67/59 | WebClient 服务未启动 | `net start WebClient` |

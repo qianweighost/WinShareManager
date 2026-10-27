@@ -332,6 +332,39 @@ function Set-AppCmdSiteProp {
     return $ok
 }
 
+# FTP 虚拟目录别名必须 ASCII：IIS FTP 对非 ASCII 别名的代码页转换不可靠，
+# 资源管理器 FTP 客户端会报 451（No mapping for the Unicode character ...），
+# 甚至列目录时直接把中文别名吞掉。非 ASCII 共享名生成 "ftp-<fnv哈希>" 稳定别名，
+# WebDAV / SMB 仍用原名（WebDAV 走 URL 编码没问题）。
+function Get-FtpAlias {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $ascii = ($Name -replace '[^A-Za-z0-9._-]', '')
+    if ($ascii -eq $Name) { return $Name }
+    # 注意：PS 里 0xFFFFFFFF 是 [int]-1，-band 它等于不掩码，必须写 4294967295
+    $h = [uint64]2166136261
+    foreach ($c in $Name.ToCharArray()) {
+        $h = $h -bxor [uint64][int]$c
+        $h = [uint64](($h * 16777619) -band 4294967295)
+    }
+    $tag = '{0:x8}' -f $h
+    if (-not $ascii) { return "ftp-$tag" }
+    return "$ascii-$tag"
+}
+
+# SFTP 上次登录用户：打开命令行连接时预填，避免默认连成 administrator
+function Get-SftpLastUser {
+    try { return [string](Get-Config).LastSftpUser } catch { return '' }
+}
+
+function Set-SftpLastUser {
+    param([Parameter(Mandatory = $true)][string]$User)
+    try {
+        $cfg = Get-Config
+        $cfg | Add-Member -NotePropertyName LastSftpUser -NotePropertyValue $User -Force
+        Save-Config -Config $cfg | Out-Null
+    } catch { }
+}
+
 function Ensure-WebDavSite {
     $cfg = Get-Config
     if (-not (Initialize-IisModule)) {
@@ -359,6 +392,9 @@ function Ensure-WebDavSite {
     [void](Set-AppCmdConfig -Site $siteName -Section 'system.webServer/security/authentication/basicAuthentication' -Value '/enabled:true')
     [void](Set-AppCmdConfig -Site $siteName -Section 'system.webServer/security/authentication/anonymousAuthentication' -Value '/enabled:false')
     [void](Set-AppCmdConfig -Site $siteName -Section 'system.webServer/security/requestFiltering' -Value '/requestLimits.maxAllowedContentLength:4294967295')
+    # 浏览器「打开」是普通 GET（PROPFIND 是 WebDAV 客户端才发的），
+    # 不开目录浏览就会 403.14。列出目录内容正好是共享需要的体验。
+    [void](Set-AppCmdConfig -Site $siteName -Section 'system.webServer/directoryBrowse' -Value '/enabled:true')
 
     # Basic 认证模块没挂上时，401 响应不带 WWW-Authenticate，浏览器直接报 401.2
     [void](Ensure-IisSiteModule -Site $siteName -ModuleName 'BasicAuthenticationModule')
@@ -489,12 +525,32 @@ function New-ShareEntry {
         $cfg = Get-Config
         if (Ensure-FtpSite) {
             try {
-                $vd = Get-WebVirtualDirectory -Site $cfg.FtpSite -Name $Name -ErrorAction SilentlyContinue
+                # FTP 目录别名必须 ASCII（中文别名会让资源管理器报 451）
+                $alias = Get-FtpAlias -Name $Name
+                if ($alias -ne $Name) {
+                    $legacy = Get-WebVirtualDirectory -Site $cfg.FtpSite -Name $Name -ErrorAction SilentlyContinue
+                    if ($legacy) {
+                        Remove-WebVirtualDirectory -Site $cfg.FtpSite -Name $Name -ErrorAction SilentlyContinue
+                        Write-Op "已移除旧 FTP 中文目录别名 $Name（改用 ASCII 别名 $alias）。" 'WARN'
+                    }
+                }
+                $vd = Get-WebVirtualDirectory -Site $cfg.FtpSite -Name $alias -ErrorAction SilentlyContinue
                 if (-not $vd) {
-                    New-WebVirtualDirectory -Site $cfg.FtpSite -Name $Name -PhysicalPath $Path -ErrorAction Stop | Out-Null
-                    Write-Op "FTP 目录已映射：ftp://$env:COMPUTERNAME`:$($cfg.FtpPort)/$Name" 'OK'
+                    New-WebVirtualDirectory -Site $cfg.FtpSite -Name $alias -PhysicalPath $Path -ErrorAction Stop | Out-Null
+                    Write-Op "FTP 目录已映射：ftp://$env:COMPUTERNAME`:$($cfg.FtpPort)/$alias" 'OK'
                 } else {
-                    Write-Op "FTP 目录 $Name 已存在，跳过。" 'WARN'
+                    Write-Op "FTP 目录 $alias 已存在，跳过。" 'WARN'
+                }
+                # IIS FTP 的目录列表不显示虚拟目录，用户从根进去会"看不见"共享。
+                # 在站点物理根目录下建一个 NTFS junction，让它在列表里真实可见。
+                $junction = Join-Path $cfg.RootBase $alias
+                if ($alias -ne $Name -and -not (Test-Path $junction)) {
+                    try {
+                        New-Item -ItemType Junction -Path $junction -Target $Path -ErrorAction Stop | Out-Null
+                        Write-Op "FTP 根目录联接已创建：$junction -> $Path" 'OK'
+                    } catch {
+                        Write-Op "FTP 根目录联接创建失败（不影响用链接直连）：$($_.Exception.Message)" 'WARN'
+                    }
                 }
             } catch {
                 Write-Op "FTP 目录创建失败：$($_.Exception.Message)" 'ERR'
@@ -544,13 +600,33 @@ function Remove-ShareEntry {
     $cfg = Get-Config
     if (Initialize-IisModule) {
         foreach ($siteName in @($cfg.WebDavSite, $cfg.FtpSite)) {
-            try {
-                $vd = Get-WebVirtualDirectory -Site $siteName -Name $Name -ErrorAction SilentlyContinue
-                if ($vd) {
-                    Remove-WebVirtualDirectory -Site $siteName -Name $Name -ErrorAction Stop
-                    Write-Op "已删除 $siteName 下的目录 $Name。" 'OK'
+            # FTP 站点下原名和 ASCII 别名都可能存在（历史版本用原名建过）
+            $names = @($Name)
+            if ($siteName -eq $cfg.FtpSite) {
+                $alias = Get-FtpAlias -Name $Name
+                if ($alias -ne $Name) { $names += $alias }
+            }
+            foreach ($n in $names) {
+                try {
+                    $vd = Get-WebVirtualDirectory -Site $siteName -Name $n -ErrorAction SilentlyContinue
+                    if ($vd) {
+                        Remove-WebVirtualDirectory -Site $siteName -Name $n -ErrorAction Stop
+                        Write-Op "已删除 $siteName 下的目录 $n。" 'OK'
+                    }
+                } catch { }
+            }
+            # FTP 站点：一并清掉根目录下的可见联接点（Directory.Delete 只删联接本身，不动目标）
+            if ($siteName -eq $cfg.FtpSite) {
+                foreach ($n in $names) {
+                    $junction = Join-Path $cfg.RootBase $n
+                    try {
+                        if ([IO.Directory]::Exists($junction)) {
+                            [IO.Directory]::Delete($junction)
+                            Write-Op "已删除 FTP 根目录联接 $junction。" 'OK'
+                        }
+                    } catch { }
                 }
-            } catch { }
+            }
         }
     }
 
@@ -612,10 +688,19 @@ function Remove-ShareProtocol {
         'FTP' {
             if (-not (Initialize-IisModule)) { Write-Op 'IIS 管理模块不可用。' 'ERR'; return $false }
             try {
-                $vd = Get-WebVirtualDirectory -Site $cfg.FtpSite -Name $Name -ErrorAction SilentlyContinue
-                if ($vd) {
-                    Remove-WebVirtualDirectory -Site $cfg.FtpSite -Name $Name -ErrorAction Stop
-                    Write-Op "已撤下 FTP 目录 $Name。" 'OK'
+                foreach ($n in @($Name, (Get-FtpAlias -Name $Name)) | Select-Object -Unique) {
+                    $vd = Get-WebVirtualDirectory -Site $cfg.FtpSite -Name $n -ErrorAction SilentlyContinue
+                    if ($vd) {
+                        Remove-WebVirtualDirectory -Site $cfg.FtpSite -Name $n -ErrorAction Stop
+                        Write-Op "已撤下 FTP 目录 $n。" 'OK'
+                    }
+                    $junction = Join-Path $cfg.RootBase $n
+                    try {
+                        if ([IO.Directory]::Exists($junction)) {
+                            [IO.Directory]::Delete($junction)
+                            Write-Op "已删除 FTP 根目录联接 $junction。" 'OK'
+                        }
+                    } catch { }
                 }
             } catch {
                 Write-Op "删除 FTP 目录失败：$($_.Exception.Message)" 'ERR'
