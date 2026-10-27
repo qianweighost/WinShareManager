@@ -2349,7 +2349,7 @@ function Show-GuideDialog {
 # ============================================================
 # 十四、事件：协议卡片
 # ============================================================
-foreach ($key in @('SMB', 'WebDAV', 'FTP', 'SFTP')) {
+foreach ($key in @('SMB', 'WebDAV', 'FTP', 'SFTP', 'DLNA')) {
     $card = $script:Cards[$key]
 
     # ---- 安装组件：交给子进程跑，界面全程可响应 ----
@@ -2869,6 +2869,10 @@ if ($env:WSM_SMOKE -eq '1') {
         $log.Add(("页面数量 : {0}" -f $script:Pages.Count))
         $log.Add(("导航按钮 : {0}" -f $script:SegBtns.Count))
         $log.Add(("协议卡片 : {0}" -f $script:Cards.Count))
+        # 每张卡片的开关必须绑了 Key（漏绑 = 点了没反应），曾经漏过 DLNA
+        $unwired = @($script:Cards.Keys | Where-Object { -not $script:Cards[$_].Toggle.Tag -or -not $script:Cards[$_].Toggle.Tag.Key })
+        if ($unwired.Count -gt 0) { $fail++; $log.Add(("开关绑定 : FAIL 未绑定 -> {0}" -f ($unwired -join ',')) ) }
+        else { $log.Add("开关绑定 : OK  全部卡片 Toggle 已绑 Key") }
     } catch { $fail++; $log.Add("基础结构 : FAIL $($_.Exception.Message)") }
 
     try {
