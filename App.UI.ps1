@@ -1586,7 +1586,7 @@ function Refresh-ShareView {
         $col.DefaultCellStyle.Alignment = 'MiddleCenter'
         $col.DefaultCellStyle.Padding   = New-Object System.Windows.Forms.Padding(0)
         [void]$gridShare.Columns.Add($col)
-        $gridShare.Columns['打开'].HeaderCell.ToolTipText = 'SMB / WebDAV / FTP 用资源管理器或浏览器打开；SFTP 复制服务器上的绝对路径'
+        $gridShare.Columns['打开'].HeaderCell.ToolTipText = 'SMB / WebDAV / FTP 用资源管理器或浏览器打开；SFTP 自动调起 WinSCP / FileZilla 或自带命令行连接'
     }
 
     # 每行单独删除一个协议（共享名是组首，协议才是这一行真正对应的东西）
@@ -2405,10 +2405,50 @@ $gridShare.Add_CellContentClick({
                 }
             }
             'SFTP' {
-                # sftp:// 没有系统级处理器；SFTP 客户端要的是服务器上的 Windows 绝对路径
+                # sftp:// 没有系统级处理器；优先带起 GUI 客户端，
+                # 其次用 Windows 自带的 OpenSSH 命令行客户端开个控制台直连，
+                # 两者都没有才退回「复制路径 + 指引」。
                 try { [System.Windows.Forms.Clipboard]::SetText($path) } catch { }
+
+                $winscp = @("$env:ProgramFiles\WinSCP\WinSCP.exe",
+                            "${env:ProgramFiles(x86)}\WinSCP\WinSCP.exe") |
+                          Where-Object { Test-Path $_ } | Select-Object -First 1
+                if ($winscp) {
+                    try {
+                        Start-Process -FilePath $winscp -ArgumentList "sftp://$env:COMPUTERNAME/"
+                        Set-Status "已启动 WinSCP 并指向本机 · 远程路径已复制：$path"
+                    } catch { Start-Process -FilePath $winscp }
+                    return
+                }
+                $filezilla = @("$env:ProgramFiles\FileZilla FTP Client\filezilla.exe",
+                               "${env:ProgramFiles(x86)}\FileZilla FTP Client\filezilla.exe") |
+                             Where-Object { Test-Path $_ } | Select-Object -First 1
+                if ($filezilla) {
+                    try {
+                        Start-Process -FilePath $filezilla -ArgumentList "sftp://$env:COMPUTERNAME"
+                        Set-Status "已启动 FileZilla · 远程路径已复制：$path"
+                    } catch { Start-Process -FilePath $filezilla }
+                    return
+                }
+                $sftpExe = Join-Path $env:windir 'System32\OpenSSH\sftp.exe'
+                if (-not (Test-Path $sftpExe)) {
+                    try { $sftpExe = (Get-Command sftp.exe -ErrorAction Stop).Source } catch { $sftpExe = $null }
+                }
+                if ($sftpExe -and (Test-Path $sftpExe)) {
+                    try {
+                        Start-Process -FilePath "$env:windir\System32\cmd.exe" `
+                            -ArgumentList "/k", "`"$sftpExe`" $env:COMPUTERNAME"
+                        Set-Status "已打开命令行连接本机 SFTP（输入密码登录，cd 到共享目录）· 远程路径已复制：$path"
+                    } catch {
+                        [void][System.Windows.Forms.MessageBox]::Show(
+                            "启动 sftp.exe 失败：$($_.Exception.Message)",
+                            'SFTP 打开方式', 'OK', 'Warning')
+                    }
+                    return
+                }
                 [void][System.Windows.Forms.MessageBox]::Show(
-                    "SFTP 没有系统级链接处理器，需要 WinSCP / FileZilla 这类客户端。",
+                    "本机没有 WinSCP / FileZilla，也没有 OpenSSH 命令行客户端。`n`n" +
+                    "已复制远程路径：$path`n请安装 WinSCP 或 FileZilla 后重试。",
                     'SFTP 打开方式', 'OK', 'Information')
                 Set-Status "已复制远程路径 $path · 粘到 SFTP 客户端的远程目录里"
             }

@@ -22,7 +22,7 @@ $script:AppName    = 'WinShareManager'
 # 界面标题、状态栏、exe 文件版本、关于信息全部读这里。
 # 构建脚本从本文件解析 $script:AppVersion，同步给 ps2exe 的 -version，
 # 所以发版只需要改这一行。
-$script:AppVersion  = '2.0.1'
+$script:AppVersion  = '2.0.2'
 $script:AppRepoName = 'qianweighost/WinShareManager'
 $script:AppRepoUrl  = 'https://github.com/qianweighost/WinShareManager'
 $script:AppReleaseUrl = "$($script:AppRepoUrl)/releases/latest"
@@ -47,7 +47,9 @@ $script:IisFeatures = @(
     'IIS-FTPSvc',
     'IIS-FTPExtensibility',
     'IIS-ManagementConsole',
-    'IIS-RequestFiltering'
+    'IIS-RequestFiltering',
+    'IIS-BasicAuthentication',
+    'IIS-WindowsAuthentication'
 )
 
 # ============================================================
@@ -288,6 +290,48 @@ function Set-AppCmdConfig {
     return (Invoke-Native -FilePath $script:AppCmd -Arguments $argList)
 }
 
+# 站点级模块开关：IIS 功能后装时，全局模块会注册，但站点若自带 <modules> 覆盖
+# 集合就可能没带上，导致 401 时没有 WWW-Authenticate 质询头（浏览器报 401.2）。
+function Ensure-IisSiteModule {
+    param(
+        [Parameter(Mandatory = $true)][string]$Site,
+        [Parameter(Mandatory = $true)][string]$ModuleName
+    )
+    $list = Invoke-Native -FilePath $script:AppCmd -Arguments @(
+        'list', 'config', $Site, '/section:system.webServer/modules')
+    if ($list.ExitCode -eq 0 -and $list.Output.Contains('name="' + $ModuleName + '"')) {
+        return $true
+    }
+    $add = Invoke-Native -FilePath $script:AppCmd -Arguments @(
+        'set', 'config', $Site, '/section:system.webServer/modules',
+        "/+[name='$ModuleName']", '/commit:apphost')
+    if ($add.ExitCode -eq 0) {
+        Write-Op "IIS 模块 $ModuleName 已在站点 $Site 启用。" 'OK'
+        return $true
+    }
+    Write-Op "IIS 模块 $ModuleName 启用失败：$($add.Output)" 'WARN'
+    return $false
+}
+
+# FTP 站点级属性：这台机器这类 schema 里 system.ftpServer/security/authentication
+# 没有独立子节（只有 denyByFailure），basicAuthentication/ssl 只在站点 ftpServer
+# 元素上生效，必须用 appcmd set site 的点路径设置，set config 会报"未知配置节"。
+function Set-AppCmdSiteProp {
+    param(
+        [Parameter(Mandatory = $true)][string]$Site,
+        [Parameter(Mandatory = $true)][string[]]$Props
+    )
+    $ok = $true
+    foreach ($p in $Props) {
+        $r = Invoke-Native -FilePath $script:AppCmd -Arguments @('set', 'site', $Site, $p)
+        if ($r.ExitCode -ne 0) {
+            Write-Op "FTP 站点属性 $p 设置失败：$($r.Output)" 'WARN'
+            $ok = $false
+        }
+    }
+    return $ok
+}
+
 function Ensure-WebDavSite {
     $cfg = Get-Config
     if (-not (Initialize-IisModule)) {
@@ -315,6 +359,10 @@ function Ensure-WebDavSite {
     [void](Set-AppCmdConfig -Site $siteName -Section 'system.webServer/security/authentication/basicAuthentication' -Value '/enabled:true')
     [void](Set-AppCmdConfig -Site $siteName -Section 'system.webServer/security/authentication/anonymousAuthentication' -Value '/enabled:false')
     [void](Set-AppCmdConfig -Site $siteName -Section 'system.webServer/security/requestFiltering' -Value '/requestLimits.maxAllowedContentLength:4294967295')
+
+    # Basic 认证模块没挂上时，401 响应不带 WWW-Authenticate，浏览器直接报 401.2
+    [void](Ensure-IisSiteModule -Site $siteName -ModuleName 'BasicAuthenticationModule')
+    [void](Ensure-IisSiteModule -Site $siteName -ModuleName 'WindowsAuthenticationModule')
 
     try {
         $wc = 'HKLM:\SYSTEM\CurrentControlSet\Services\WebClient\Parameters'
@@ -352,6 +400,15 @@ function Ensure-FtpSite {
     [void](Set-AppCmdConfig -Site $siteName -Section 'system.ftpServer/security/authentication/basicAuthentication' -Value '/enabled:true')
     [void](Set-AppCmdConfig -Site $siteName -Section 'system.ftpServer/security/authentication/anonymousAuthentication' -Value '/enabled:false')
     [void](Set-AppCmdConfig -Site $siteName -Section 'system.ftpServer/security/authorization' -Value "/+[accessType='Allow',users='*',permissions='Read,Write']")
+
+    # 上面的 set config 在部分机器上会因 schema 缺子节而失败（"未知配置节"），
+    # 再用站点属性路径兜底一遍：basic 开、匿名关、明文通道放行（否则登录报 534）。
+    [void](Set-AppCmdSiteProp -Site $siteName -Props @(
+        '/ftpServer.security.authentication.basicAuthentication.enabled:true',
+        '/ftpServer.security.authentication.anonymousAuthentication.enabled:false',
+        '/ftpServer.security.ssl.controlChannelPolicy:SslAllow',
+        '/ftpServer.security.ssl.dataChannelPolicy:SslAllow'
+    ))
 
     return $true
 }
@@ -1691,7 +1748,7 @@ function Install-Plugin {
                        'IIS-DirectoryBrowsing', 'IIS-ManagementConsole')
         }
         'IIS-WEBDAV' {
-            $feats = @('IIS-WebDAV')
+            $feats = @('IIS-WebDAV', 'IIS-BasicAuthentication', 'IIS-WindowsAuthentication')
         }
         'IIS-FTP' {
             $feats = @('IIS-FTPServer', 'IIS-FTPSvc', 'IIS-FTPExtensibility')

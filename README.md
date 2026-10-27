@@ -1,6 +1,6 @@
 # WinShareManager
 
-[![version](https://img.shields.io/badge/version-2.0.1-2f7bf6)](https://github.com/qianweighost/WinShareManager/releases/latest)
+[![version](https://img.shields.io/badge/version-2.0.2-2f7bf6)](https://github.com/qianweighost/WinShareManager/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-34a84a)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-8e8e93)](#)
 [![release](https://img.shields.io/github/v/release/qianweighost/WinShareManager?label=release&color=f5a623)](https://github.com/qianweighost/WinShareManager/releases/latest)
@@ -440,6 +440,9 @@ $env:WSM_DLG_SHOT='C:\temp\dlg'; $env:WSM_TASK_SHOT='C:\temp\task.png'
 | 现象 | 原因 | 对策 |
 |---|---|---|
 | WebDAV 访问报 405 | 未配置创作规则 | 程序已通过 appcmd 写入 `authoringRules` |
+| WebDAV 浏览器访问报 401.2（无登录框） | `IIS-BasicAuthentication` 功能未启用，401 响应不带 `WWW-Authenticate` 质询头 | v2.0.2 起 WebDAV 安装链自动启用 Basic/Windows 认证功能并确保站点挂上 `BasicAuthenticationModule` |
+| FTP 登录报 534（策略要求 SSL） | 站点 `ssl` 默认 `SslRequire`；且部分机器 schema 缺 `basicAuthentication` 子节，`appcmd set config` 报「未知配置节」 | v2.0.2 起改用 `appcmd set site` 的 `ftpServer.*` 点路径设置：Basic 开、匿名关、`SslAllow` 放行明文通道 |
+| FTP 登录报 530 | 没有任何认证方式启用（默认 Basic/匿名都关） | 程序已启用 Basic 认证（用 Windows 本机账号登录） |
 | WebDAV 上传超过 30MB 失败 | requestFiltering 默认限制 | 程序已设为 4GB |
 | 资源管理器挂 WebDAV 报 67/59 | WebClient 服务未启动 | `net start WebClient` |
 | 资源管理器 WebDAV 大文件失败 | 客户端 47MB 限制 | 程序已改注册表 `FileSizeLimitInBytes` |
