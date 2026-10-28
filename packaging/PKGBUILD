@@ -1,0 +1,25 @@
+# Maintainer: qianwei <qianwei@users.noreply.github.com>
+# WinShareManager for Linux — CachyOS / Arch 安装包
+# 用法：makepkg -si  （或 paru/yay -S winsharemanager 若已收录 AUR）
+
+pkgname=winsharemanager
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="SMB / WebDAV / FTP / SFTP / DLNA 共享管理器（苹果风 GUI）"
+arch=('any')
+url="https://github.com/qianweighost/WinShareManager"
+license=('MIT')
+depends=('python' 'tk' 'polkit')
+optdepends=('samba: SMB 共享' 'vsftpd: FTP 共享' 'minidlna: DLNA 共享'
+            'openssh: SFTP 共享' 'ufw: 防火墙配置')
+install=winsharemanager.install
+source=("winsharemanager::https://github.com/qianweighost/WinShareManager/raw/v3.0.0/linux/winsharemanager"
+        "winsharemanager.desktop::https://github.com/qianweighost/WinShareManager/raw/v3.0.0/packaging/winsharemanager.desktop"
+        "winsharemanager.png::https://github.com/qianweighost/WinShareManager/raw/v3.0.0/packaging/winsharemanager.png")
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm755 winsharemanager "$pkgdir/usr/bin/winsharemanager"
+    install -Dm644 winsharemanager.desktop "$pkgdir/usr/share/applications/winsharemanager.desktop"
+    install -Dm644 winsharemanager.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/winsharemanager.png"
+}

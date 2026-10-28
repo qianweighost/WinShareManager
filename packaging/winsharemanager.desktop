@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=WinShareManager
+Name[zh_CN]=共享管理器
+GenericName=LAN Sharing Manager
+Comment=Manage SMB / WebDAV / FTP / SFTP / DLNA shares
+Comment[zh_CN]=一站式管理 SMB / WebDAV / FTP / SFTP / DLNA 共享
+Exec=pkexec /usr/bin/winsharemanager
+Icon=winsharemanager
+Terminal=false
+Categories=Network;FileTransfer;System;
+Keywords=share;smb;samba;webdav;ftp;sftp;dlna;共享;
+StartupNotify=true

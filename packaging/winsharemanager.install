@@ -1,0 +1,12 @@
+# Arch install 脚本
+post_install() {
+    echo "WinShareManager 安装完成。"
+    echo "启动：应用菜单「共享管理器」或 pkexec winsharemanager"
+    echo "自检：sudo winsharemanager --probe"
+}
+
+pre_remove() {
+    systemctl stop winsharemanager-webdav.service 2>/dev/null || true
+    systemctl disable winsharemanager-webdav.service 2>/dev/null || true
+    rm -f /etc/systemd/system/winsharemanager-webdav.service
+}

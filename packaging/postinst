@@ -1,0 +1,14 @@
+#!/bin/sh
+# postinst — WinShareManager for Linux
+set -e
+
+chmod 755 /usr/bin/winsharemanager 2>/dev/null || true
+
+# 桌面入口默认走 pkexec 提权；确保 polkit agent 可用环境无需额外配置
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+fi
+
+echo "WinShareManager 安装完成。启动方式：应用菜单「共享管理器」或命令行 pkexec winsharemanager"
+echo "部署自检：sudo winsharemanager --probe"
+exit 0

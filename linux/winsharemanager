@@ -1,0 +1,1224 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+WinShareManager for Linux
+=========================
+SMB / WebDAV / FTP / SFTP / DLNA 共享管理器（Ubuntu / CachyOS / Arch 系适配）
+
+  * SMB    → samba（smb.conf 标记块管理，smbpasswd 管账号）
+  * WebDAV → 内置纯 Python 服务器（systemd 服务 winsharemanager-webdav 常驻）
+  * FTP    → vsftpd（共享目录 bind-mount 到 /srv/winsharemanager/ftp/）
+  * SFTP   → sshd（目录即路径，权限由 NTFS→Linux 文件权限决定）
+  * DLNA   → minidlna（自动生成 /etc/minidlna.conf）
+
+用法：
+  pkexec winsharemanager        # 图形界面（桌面入口默认走 pkexec 提权）
+  sudo winsharemanager          # 等价
+  winsharemanager --serve       # 无头模式：只跑 WebDAV 服务（systemd 调用）
+  winsharemanager --probe       # 无头模式：打印环境探测结果，用于部署自检
+"""
+
+import base64
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+APP_VERSION = '1.0.0'
+APP_NAME = 'WinShareManager'
+GITHUB_URL = 'https://github.com/qianweighost/WinShareManager'
+CONFIG_DIR = '/etc/winsharemanager'
+CONFIG_PATH = os.path.join(CONFIG_DIR, 'config.json')
+DAV_SERVICE = 'winsharemanager-webdav.service'
+DAV_UNIT_PATH = '/etc/systemd/system/' + DAV_SERVICE
+FTP_ROOT = '/srv/winsharemanager/ftp'
+SMB_MARK_BEGIN = '# >>> WinShareManager BEGIN (managed, do not edit)'
+SMB_MARK_END = '# <<< WinShareManager END'
+FSTAB_MARK_BEGIN = '# >>> WinShareManager BEGIN (managed, do not edit)'
+FSTAB_MARK_END = '# <<< WinShareManager END'
+
+DEFAULT_CONFIG = {
+    'version': 1,
+    'dav_port': 8081,
+    'dav_user': 'share',
+    'dav_password': '',
+    'ftp_port': 21,
+    'dlna_port': 8200,
+    'shares': [],
+}
+
+
+# ============================================================
+# 发行版检测与包管理
+# ============================================================
+
+def detect_distro():
+    info = {}
+    try:
+        with open('/etc/os-release', 'r', encoding='utf-8') as f:
+            for line in f:
+                if '=' in line:
+                    k, v = line.rstrip('\n').split('=', 1)
+                    info[k] = v.strip('"')
+    except OSError:
+        pass
+    distro_id = (info.get('ID') or 'linux').lower()
+    like = (info.get('ID_LIKE') or '').lower()
+    if distro_id in ('ubuntu', 'debian', 'linuxmint') or 'debian' in like:
+        family = 'debian'
+    elif distro_id in ('cachyos', 'arch', 'manjaro', 'endeavouros', 'garuda') or 'arch' in like:
+        family = 'arch'
+    else:
+        family = 'unknown'
+    return family, distro_id, info.get('PRETTY_NAME', distro_id)
+
+
+DISTRO_FAMILY, DISTRO_ID, DISTRO_PRETTY = detect_distro()
+
+# 两大家族的包名 / 服务名差异全部收敛到这里
+if DISTRO_FAMILY == 'debian':
+    PKG = {'smb': 'samba', 'ftp': 'vsftpd', 'dlna': 'minidlna', 'sftp': 'openssh-server'}
+    SVC = {'smb': ['smbd', 'nmbd'], 'ftp': ['vsftpd'], 'dlna': ['minidlna'], 'sftp': ['ssh']}
+elif DISTRO_FAMILY == 'arch':
+    PKG = {'smb': 'samba', 'ftp': 'vsftpd', 'dlna': 'minidlna', 'sftp': 'openssh'}
+    SVC = {'smb': ['smb', 'nmb'], 'ftp': ['vsftpd'], 'dlna': ['minidlna'], 'sftp': ['sshd']}
+else:
+    PKG = {'smb': 'samba', 'ftp': 'vsftpd', 'dlna': 'minidlna', 'sftp': 'openssh-server'}
+    SVC = {'smb': ['smbd', 'nmbd'], 'ftp': ['vsftpd'], 'dlna': ['minidlna'], 'sftp': ['sshd']}
+
+
+# ============================================================
+# 基础工具
+# ============================================================
+
+class Reporter:
+    """日志收集器：GUI 模式接回调，无头模式打 stdout。"""
+
+    def __init__(self):
+        self.callback = None
+        self.lines = []
+
+    def log(self, msg, level='INFO'):
+        entry = '[{}][{}] {}'.format(time.strftime('%Y-%m-%d %H:%M:%S'), level, msg)
+        self.lines.append(entry)
+        if self.callback:
+            try:
+                self.callback(entry, level)
+            except Exception:
+                pass
+        else:
+            print(entry, flush=True)
+
+
+R = Reporter()
+
+
+def run(cmd, timeout=60, input_text=None):
+    """执行命令，返回 (ok, stdout+stderr)。永远不抛异常。"""
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                           input=input_text, text=(input_text is not None))
+        out = (p.stdout or '') + (p.stderr or '')
+        return p.returncode == 0, out.strip()
+    except FileNotFoundError:
+        return False, '命令不存在: {}'.format(cmd[0])
+    except subprocess.TimeoutExpired:
+        return False, '命令超时: {}'.format(' '.join(cmd))
+    except Exception as e:
+        return False, str(e)
+
+
+def systemctl(action, unit):
+    return systemctl_multi(action, [unit])
+
+
+def systemctl_multi(action, units):
+    ok_all, out_all = True, []
+    for u in units:
+        ok, out = run(['systemctl', action, u])
+        ok_all = ok_all and ok
+        if out:
+            out_all.append(out)
+    return ok_all, '\n'.join(out_all)
+
+
+def daemon_reload():
+    run(['systemctl', 'daemon-reload'])
+
+
+def read_text(path, default=''):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def write_text(path, content, mode=None):
+    os.makedirs(os.path.dirname(path) or '/', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    if mode is not None:
+        os.chmod(path, mode)
+
+
+def replace_marked_block(path, begin, end, new_block):
+    """替换文件中 BEGIN/END 标记块；没有标记则追加。"""
+    text = read_text(path)
+    pattern = re.compile(re.escape(begin) + r'.*?' + re.escape(end) + r'\n?', re.S)
+    body = new_block.rstrip('\n') + '\n' if new_block.strip() else ''
+    if pattern.search(text):
+        text = pattern.sub(body, text)
+    else:
+        if text and not text.endswith('\n'):
+            text += '\n'
+        text += '\n' + body
+    write_text(path, text)
+
+
+# ============================================================
+# 配置
+# ============================================================
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    raw = read_text(CONFIG_PATH)
+    if raw.strip():
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                cfg.update(data)
+        except ValueError:
+            pass
+    if not isinstance(cfg.get('shares'), list):
+        cfg['shares'] = []
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_PATH + '.tmp'
+    write_text(tmp, json.dumps(cfg, ensure_ascii=False, indent=2))
+    os.replace(tmp, CONFIG_PATH)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def get_share(cfg, name):
+    for s in cfg['shares']:
+        if s.get('name') == name:
+            return s
+    return None
+
+
+def ftp_alias(name):
+    """共享名 → ASCII 别名（中文目录名在 FTP 列表会出 451），FNV-1a。"""
+    if all(ord(c) < 128 for c in name) and re.match(r'^[A-Za-z0-9._-]+$', name):
+        return name
+    h = 2166136261
+    for c in name:
+        h ^= ord(c) & 0xFF
+        h = (h * 16777619) & 0xFFFFFFFF
+        h ^= (ord(c) >> 8) & 0xFF
+        h = (h * 16777619) & 0xFFFFFFFF
+    return 'ftp-{0:08x}'.format(h)
+
+
+# ============================================================
+# SMB（samba）
+# ============================================================
+
+def smb_enabled_conf():
+    """读取 smb.conf 里标记块下当前已有的共享段名。"""
+    text = read_text('/etc/samba/smb.conf')
+    block = ''
+    m = re.search(re.escape(SMB_MARK_BEGIN) + r'(.*?)' + re.escape(SMB_MARK_END), text, re.S)
+    if m:
+        block = m.group(1)
+    return re.findall(r'^\[([^\]]+)\]', block, re.M)
+
+
+def smb_sync(cfg):
+    """把配置里的 SMB 共享整体写进 smb.conf 标记块。"""
+    lines = [SMB_MARK_BEGIN]
+    for s in cfg['shares']:
+        if 'smb' not in (s.get('protocols') or []):
+            continue
+        name = s['name']
+        users = ', '.join(s.get('smb_users') or [])
+        lines += [
+            '[{}]'.format(name),
+            '   comment = WinShareManager share',
+            '   path = {}'.format(s['path']),
+            '   browseable = yes',
+            '   read only = no',
+            '   guest ok = no',
+            '   force user = root',
+        ]
+        if users:
+            lines.append('   valid users = {}'.format(users))
+        lines.append('')
+    lines.append(SMB_MARK_END)
+    replace_marked_block('/etc/samba/smb.conf', SMB_MARK_BEGIN, SMB_MARK_END, '\n'.join(lines))
+
+
+def smb_sync_users(cfg):
+    """把 GUI 里设置的 SMB 账号同步给 smbpasswd（密码存配置，重复设置幂等）。"""
+    users = {}
+    for s in cfg['shares']:
+        for u in (s.get('smb_users') or []):
+            if isinstance(u, dict):
+                users[u['name']] = u.get('password') or ''
+    for name, pwd in users.items():
+        if not name:
+            continue
+        run(['id', name])  # 必须是系统用户
+        if not pwd:
+            continue
+        ok, _ = run(['pdbedit', '-L'], timeout=15)
+        listed = ok  # 仅作提示
+        p = subprocess.run(['smbpasswd', '-a', '-s', name], input=(pwd + '\n' + pwd + '\n'),
+                           capture_output=True, text=True, timeout=20)
+        if p.returncode == 0:
+            R.log('SMB 账号 {} 已就绪。'.format(name), 'OK')
+        else:
+            R.log('SMB 账号 {} 设置失败：{}'.format(name, (p.stderr or p.stdout).strip()), 'WARN')
+
+
+def smb_apply(cfg):
+    smb_sync(cfg)
+    smb_sync_users(cfg)
+    # samba 默认配置里 server role 等不同发行版差异大，只保证 daemon 起来
+    ok, out = systemctl_multi('restart', SVC['smb'])
+    if not ok:
+        R.log('samba 重启失败：{}'.format(out), 'ERR')
+        return False
+    R.log('SMB 共享已发布：\\\\{}\\<共享名>'.format(socket.gethostname()), 'OK')
+    return True
+
+
+# ============================================================
+# FTP（vsftpd + bind-mount）
+# ============================================================
+
+def ftp_write_conf(cfg):
+    port = int(cfg.get('ftp_port') or 21)
+    conf = '\n'.join([
+        '# WinShareManager 管理的 vsftpd 配置（直接覆盖主配置）',
+        'listen=YES',
+        'listen_ipv6=NO',
+        'listen_port={}'.format(port),
+        'anonymous_enable=NO',
+        'local_enable=YES',
+        'write_enable=YES',
+        'local_umask=022',
+        'dirmessage_enable=YES',
+        'use_localtime=YES',
+        'xferlog_enable=YES',
+        'connect_from_port_20=YES',
+        'chroot_local_user=YES',
+        'allow_writeable_chroot=YES',
+        'local_root={}'.format(FTP_ROOT),
+        'secure_chroot_dir=/var/run/vsftpd/empty',
+        'pam_service_name=vsftpd',
+        'utf8_filesystem=YES',
+        '',
+    ])
+    write_text('/etc/vsftpd.conf', conf, 0o644)
+
+
+def ftp_sync_mounts(cfg):
+    """每个 FTP 共享：bind-mount 到 FTP_ROOT/<alias>，并写 fstab 标记块保持久。"""
+    os.makedirs(FTP_ROOT, exist_ok=True)
+    wanted = {}
+    for s in cfg['shares']:
+        if 'ftp' in (s.get('protocols') or []):
+            wanted[ftp_alias(s['name'])] = s['path']
+
+    # 建/更新 bind mount
+    for alias, src in wanted.items():
+        dst = os.path.join(FTP_ROOT, alias)
+        os.makedirs(dst, exist_ok=True)
+        if not os.path.ismount(dst):
+            ok, out = run(['mount', '--bind', src, dst])
+            if ok:
+                R.log('FTP 目录已映射（bind）：{} -> {}'.format(dst, src), 'OK')
+            else:
+                R.log('bind mount 失败 {}: {}'.format(dst, out), 'ERR')
+
+    # 清掉已删除共享的挂载
+    for entry in os.listdir(FTP_ROOT):
+        dst = os.path.join(FTP_ROOT, entry)
+        if entry not in wanted and os.path.ismount(dst):
+            run(['umount', dst])
+            try:
+                os.rmdir(dst)
+            except OSError:
+                pass
+
+    # fstab 标记块（持久化）
+    lines = [FSTAB_MARK_BEGIN]
+    for alias, src in wanted.items():
+        lines.append('{}  {}  none  bind  0  0'.format(src, os.path.join(FTP_ROOT, alias)))
+    lines.append(FSTAB_MARK_END)
+    replace_marked_block('/etc/fstab', FSTAB_MARK_BEGIN, FSTAB_MARK_END, '\n'.join(lines))
+
+
+def ftp_apply(cfg):
+    ftp_write_conf(cfg)
+    ftp_sync_mounts(cfg)
+    ok, out = systemctl_multi('restart', SVC['ftp'])
+    if not ok:
+        R.log('vsftpd 重启失败：{}'.format(out), 'ERR')
+        return False
+    R.log('FTP 已发布：ftp://{}:{}（系统账号登录，共享在根目录下）'.format(socket.gethostname(), cfg.get('ftp_port')), 'OK')
+    return True
+
+
+# ============================================================
+# SFTP（sshd）
+# ============================================================
+
+def sftp_apply(cfg):
+    ok, out = systemctl_multi('restart', SVC['sftp'])
+    if not ok:
+        R.log('sshd 启动失败：{}'.format(out), 'ERR')
+        return False
+    R.log('SFTP 已就绪：sftp <系统用户>@{}（用绝对路径访问共享目录）'.format(socket.gethostname()), 'OK')
+    return True
+
+
+# ============================================================
+# DLNA（minidlna）
+# ============================================================
+
+def dlna_write_conf(cfg):
+    port = int(cfg.get('dlna_port') or 8200)
+    lines = [
+        '# WinShareManager 生成的 minidlna 配置',
+        'port={}'.format(port),
+        'friendly_name=WinShareManager ({})'.format(socket.gethostname()),
+        'db_dir=/var/cache/minidlna',
+        'log_dir=/var/log/minidlna',
+        'inotify=yes',
+        'enable_tivo=no',
+        'strict_dlna=no',
+        'presentation_url=http://{}:{}/'.format(socket.gethostname(), port),
+    ]
+    for s in cfg['shares']:
+        if 'dlna' in (s.get('protocols') or []):
+            lines.append('media_dir={}'.format(s['path']))
+    if not any('dlna' in (s.get('protocols') or []) for s in cfg['shares']):
+        lines.append('media_dir=/var/lib/minidlna')
+    lines.append('')
+    write_text('/etc/minidlna.conf', '\n'.join(lines), 0o644)
+    run(['mkdir', '-p', '/var/cache/minidlna', '/var/log/minidlna'])
+
+
+def dlna_apply(cfg):
+    dlna_write_conf(cfg)
+    ok, out = systemctl_multi('restart', SVC['dlna'])
+    if not ok:
+        R.log('minidlna 重启失败：{}'.format(out), 'ERR')
+        return False
+    R.log('DLNA 媒体服务器已启动：端口 {}（电视 / 手机自动发现；DLNA 无账号密码，全内网可读）'.format(cfg.get('dlna_port')), 'OK')
+    return True
+
+
+# ============================================================
+# WebDAV（内置纯 Python 服务器）
+# ============================================================
+
+def dav_resolve(share, rel):
+    """把 URL 相对路径解析为共享内的绝对路径，杜绝越界。"""
+    rel = rel.replace('\\', '/')
+    rel = re.sub(r'^/+', '', rel)
+    root = os.path.realpath(share['path'])
+    full = os.path.realpath(os.path.join(root, rel))
+    if full != root and not full.startswith(root + os.sep):
+        return None
+    return full
+
+
+class DavHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    server_version = 'WinShareManager-DAV/' + APP_VERSION
+
+    # ---- 认证 ----
+    def _authed(self):
+        want = '{}:{}'.format(self.server.dav_user, self.server.dav_password)
+        got = self.headers.get('Authorization') or ''
+        if got.startswith('Basic '):
+            try:
+                if base64.b64decode(got[6:]).decode('utf-8') == want:
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="WinShareManager"')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+        return False
+
+    def _find_share(self):
+        """URL 第一段 = 共享名。返回 (share, rel_path) 或 None。"""
+        path = self.path.split('?')[0]
+        path = path.split('#')[0]
+        try:
+            from urllib.parse import unquote
+            path = unquote(path)
+        except Exception:
+            pass
+        parts = [p for p in path.split('/') if p]
+        if not parts:
+            return None, None
+        for s in self.server.dav_shares:
+            if s['name'] == parts[0]:
+                return s, '/'.join(parts[1:])
+        return None, None
+
+    def _escape_xml(self, s):
+        return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+    def _prop_response(self, share, rel, depth, out):
+        full = dav_resolve(share, rel)
+        if full is None:
+            return False
+        is_dir = os.path.isdir(full)
+        href = '/' + share['name'] + ('/' + rel if rel else '')
+        out.append('<D:response><D:href>{}</D:href><D:propstat><D:prop>'.format(self._escape_xml(href)))
+        out.append('<D:displayname>{}</D:displayname>'.format(self._escape_xml(os.path.basename(href) or share['name'])))
+        out.append('<D:resourcetype>{}</D:resourcetype>'.format('<D:collection/>' if is_dir else ''))
+        try:
+            st = os.stat(full)
+            out.append('<D:getlastmodified>{}</D:getlastmodified>'.format(
+                time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime(st.st_mtime))))
+            if not is_dir:
+                out.append('<D:getcontentlength>{}</D:getcontentlength>'.format(st.st_size))
+        except OSError:
+            pass
+        out.append('</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>')
+        if is_dir and depth >= 1:
+            try:
+                entries = sorted(os.listdir(full))
+            except OSError:
+                entries = []
+            for e in entries:
+                child_rel = (rel + '/' if rel else '') + e
+                if not self._prop_response(share, child_rel, depth - 1, out):
+                    continue
+        return True
+
+    def _send(self, code, body=b'', ctype='text/plain', extra=None):
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if body and self.command != 'HEAD':
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _not_found(self):
+        self._send(404, b'not found')
+
+    # ---- 各方法 ----
+    def do_OPTIONS(self):
+        self._send(200, b'', extra={
+            'DAV': '1,2',
+            'Allow': 'OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY',
+            'MS-Author-Via': 'DAV',
+        })
+
+    def do_PROPFIND(self):
+        if not self._authed():
+            return
+        share, rel = self._find_share()
+        if share is None:
+            return self._not_found()
+        depth = int((self.headers.get('Depth') or '1').strip() or 1)
+        out = ['<?xml version="1.0" encoding="utf-8"?>',
+               '<D:multistatus xmlns:D="DAV:">']
+        if not self._prop_response(share, rel, depth, out):
+            return self._not_found()
+        out.append('</D:multistatus>')
+        body = ''.join(out).encode('utf-8')
+        self._send(207, body, 'text/xml; charset="utf-8"')
+
+    def do_PROPPATCH(self):
+        if not self._authed():
+            return
+        body = b'<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"></D:multistatus>'
+        self._send(207, body, 'text/xml; charset="utf-8"')
+
+    def do_GET(self):
+        self._dav_get()
+
+    def do_HEAD(self):
+        self._dav_get(head=True)
+
+    def _dav_get(self, head=False):
+        if not self._authed():
+            return
+        share, rel = self._find_share()
+        if share is None:
+            return self._not_found()
+        full = dav_resolve(share, rel)
+        if full is None or not os.path.isfile(full):
+            return self._not_found()
+        size = os.path.getsize(full)
+        start, end, code = 0, size - 1, 200
+        rng = self.headers.get('Range')
+        if rng and rng.startswith('bytes='):
+            m = re.match(r'bytes=(\d*)-(\d*)', rng)
+            if m:
+                if m.group(1):
+                    start = int(m.group(1))
+                if m.group(2):
+                    end = int(m.group(2))
+                end = min(end, size - 1)
+                code = 206
+        if start > end or start >= size:
+            self._send(416, b'bad range')
+            return
+        length = end - start + 1
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Content-Length', str(length))
+        if code == 206:
+            self.send_header('Content-Range', 'bytes {}-{}/{}'.format(start, end, size))
+        self.end_headers()
+        if head:
+            return
+        with open(full, 'rb') as f:
+            f.seek(start)
+            sent = 0
+            while sent < length:
+                chunk = f.read(min(65536, length - sent))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                sent += len(chunk)
+
+    def do_PUT(self):
+        if not self._authed():
+            return
+        share, rel = self._find_share()
+        if share is None or not rel:
+            return self._not_found()
+        full = dav_resolve(share, rel)
+        if full is None:
+            return self._send(403, b'forbidden')
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        length = int(self.headers.get('Content-Length') or 0)
+        with open(full, 'wb') as f:
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+        self._send(201 if length else 204)
+
+    def do_MKCOL(self):
+        if not self._authed():
+            return
+        share, rel = self._find_share()
+        if share is None or not rel:
+            return self._send(405, b'bad')
+        full = dav_resolve(share, rel)
+        if full is None or os.path.exists(full):
+            return self._send(405, b'exists')
+        os.makedirs(full, exist_ok=True)
+        self._send(201)
+
+    def do_DELETE(self):
+        if not self._authed():
+            return
+        share, rel = self._find_share()
+        if share is None or not rel:
+            return self._send(403, b'forbidden')
+        full = dav_resolve(share, rel)
+        if full is None or not os.path.exists(full):
+            return self._not_found()
+        if os.path.isdir(full):
+            shutil.rmtree(full, ignore_errors=True)
+        else:
+            os.remove(full)
+        self._send(204)
+
+    def _dest_path(self):
+        dest = self.headers.get('Destination') or ''
+        dest = re.sub(r'^https?://[^/]+', '', dest)
+        try:
+            from urllib.parse import unquote
+            dest = unquote(dest)
+        except Exception:
+            pass
+        return dest
+
+    def do_MOVE(self):
+        self._dav_move(copy=False)
+
+    def do_COPY(self):
+        self._dav_move(copy=True)
+
+    def _dav_move(self, copy):
+        if not self._authed():
+            return
+        share, rel = self._find_share()
+        if share is None or not rel:
+            return self._not_found()
+        src = dav_resolve(share, rel)
+        dparts = [p for p in self._dest_path().split('/') if p]
+        if src is None or not os.path.exists(src) or len(dparts) < 2 or dparts[0] != share['name']:
+            return self._not_found()
+        dst = dav_resolve(share, '/'.join(dparts[1:]))
+        if dst is None:
+            return self._send(403, b'forbidden')
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if copy:
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+        else:
+            shutil.move(src, dst)
+        self._send(201 if copy else 204)
+
+    def log_message(self, fmt, *args):
+        pass  # 静默访问日志
+
+
+def dav_start_server(cfg, quiet=False):
+    """创建并返回 WebDAV HTTP server（未启动线程）。"""
+    shares = [s for s in cfg['shares'] if 'webdav' in (s.get('protocols') or [])]
+    port = int(cfg.get('dav_port') or 8081)
+    srv = ThreadingHTTPServer(('0.0.0.0', port), DavHandler)
+    srv.dav_shares = shares
+    srv.dav_user = cfg.get('dav_user') or 'share'
+    srv.dav_password = cfg.get('dav_password') or ''
+    srv.daemon_threads = True
+    if not quiet:
+        R.log('WebDAV 服务已就绪：http://{}:{} /<共享名>（账号 {}）'.format(
+            socket.gethostname(), port, srv.dav_user), 'OK')
+    return srv
+
+
+def dav_write_unit(cfg):
+    unit = '\n'.join([
+        '[Unit]',
+        'Description=WinShareManager WebDAV server',
+        'After=network.target',
+        '',
+        '[Service]',
+        'Type=simple',
+        'ExecStart=/usr/bin/winsharemanager --serve',
+        'Restart=on-failure',
+        'RestartSec=2',
+        '',
+        '[Install]',
+        'WantedBy=multi-user.target',
+        '',
+    ])
+    write_text(DAV_UNIT_PATH, unit, 0o644)
+    daemon_reload()
+
+
+def webdav_apply(cfg, restart_service=True):
+    if not cfg.get('dav_password'):
+        R.log('尚未设置 WebDAV 密码（设置页里配置），服务先按空密码拒绝一切请求。', 'WARN')
+    dav_write_unit(cfg)
+    if restart_service:
+        run(['systemctl', 'enable', DAV_SERVICE])
+        ok, out = run(['systemctl', 'restart', DAV_SERVICE])
+        if not ok:
+            R.log('WebDAV 服务重启失败：{}'.format(out), 'ERR')
+            return False
+        R.log('WebDAV 已发布：http://{}:{}/<共享名>'.format(socket.gethostname(), cfg.get('dav_port')), 'OK')
+    return True
+
+
+# ============================================================
+# 编排：安装 / 应用 / 启停
+# ============================================================
+
+PROTO_META = {
+    'smb':    {'label': 'SMB',    'hint': 'Windows 文件共享，资源管理器直接访问'},
+    'webdav': {'label': 'WebDAV', 'hint': '内置服务器 + systemd 常驻，账号密码登录'},
+    'ftp':    {'label': 'FTP',    'hint': 'vsftpd，系统账号登录，共享 bind-mount 到根'},
+    'sftp':   {'label': 'SFTP',   'hint': 'sshd 原生支持，绝对路径访问'},
+    'dlna':   {'label': 'DLNA',   'hint': 'minidlna，电视/手机自动发现，无密码'},
+}
+
+PROTOCOL_KEYS = ['smb', 'webdav', 'ftp', 'sftp', 'dlna']
+
+
+def install_packages(protos):
+    pkgs = sorted({PKG[p] for p in protos if p in PKG})
+    if not pkgs:
+        return True
+    if DISTRO_FAMILY == 'debian':
+        R.log('正在安装：{}（apt）'.format(' '.join(pkgs)))
+        run(['apt-get', 'update', '-y'], timeout=300)
+        ok, out = run(['apt-get', 'install', '-y'] + pkgs, timeout=600)
+    else:
+        R.log('正在安装：{}（pacman）'.format(' '.join(pkgs)))
+        ok, out = run(['pacman', '-S', '--noconfirm', '--needed'] + pkgs, timeout=600)
+    if ok:
+        R.log('依赖已安装。', 'OK')
+    else:
+        R.log('依赖安装失败：{}'.format(out[-400:]), 'ERR')
+    return ok
+
+
+def apply_shares(cfg):
+    """按配置把所有共享落地（幂等，可反复点）。"""
+    protos = set()
+    for s in cfg['shares']:
+        protos.update(s.get('protocols') or [])
+    if protos:
+        install_packages(protos)
+
+    ok = True
+    if 'smb' in protos:
+        ok = smb_apply(cfg) and ok
+    if 'ftp' in protos:
+        ok = ftp_apply(cfg) and ok
+    if 'sftp' in protos:
+        ok = sftp_apply(cfg) and ok
+    if 'dlna' in protos:
+        ok = dlna_apply(cfg) and ok
+    if 'webdav' in protos:
+        ok = webdav_apply(cfg) and ok
+    if not protos:
+        R.log('当前没有任何共享，无可发布内容。', 'WARN')
+    return ok
+
+
+def protocol_status(key):
+    """探测某协议当前是否在运行（给卡片状态灯用）。"""
+    try:
+        if key == 'webdav':
+            ok, out = run(['systemctl', 'is-active', DAV_SERVICE])
+            return out.strip() == 'active'
+        for unit in SVC.get(key, []):
+            ok, out = run(['systemctl', 'is-active', unit])
+            if out.strip() == 'active':
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def protocol_installed(key):
+    if key not in PKG:
+        return True
+    ok, out = run(['which', {
+        'samba': 'smbd', 'vsftpd': 'vsftpd', 'minidlna': 'minidlnad',
+    }.get(PKG[key], PKG[key])], timeout=10)
+    if not ok:
+        ok, out = run(['systemctl', 'list-unit-files', SVC.get(key, [key])[0] + '.service'], timeout=10)
+        return ok and 'service' in out
+    return True
+
+
+def stop_protocol(key):
+    units = SVC.get(key, [])
+    if key == 'webdav':
+        units = [DAV_SERVICE]
+    if not units:
+        return True
+    ok, out = systemctl_multi('stop', units)
+    if ok:
+        R.log('{} 已停止。'.format(PROTO_META[key]['label']), 'OK')
+    else:
+        R.log('{} 停止失败：{}'.format(PROTO_META[key]['label'], out), 'ERR')
+    return ok
+
+
+def start_protocol(key, cfg):
+    """启动某协议（先确保配置落地，再拉服务）。"""
+    if key == 'smb':
+        return smb_apply(cfg)
+    if key == 'ftp':
+        return ftp_apply(cfg)
+    if key == 'sftp':
+        return sftp_apply(cfg)
+    if key == 'dlna':
+        return dlna_apply(cfg)
+    if key == 'webdav':
+        return webdav_apply(cfg)
+    return False
+
+
+def apply_ports(cfg):
+    """开放防火墙（ufw 存在就配；没有就跳过，多数桌面默认无阻拦）。"""
+    ok_ufw, _ = run(['which', 'ufw'], timeout=10)
+    if not ok_ufw:
+        return
+    ports = {21, 445, int(cfg.get('dav_port') or 8081), int(cfg.get('dlna_port') or 8200), 1900}
+    for p in sorted(ports):
+        run(['ufw', 'allow', str(p)], timeout=15)
+    R.log('防火墙（ufw）已放行 {}。'.format(', '.join(str(p) for p in sorted(ports))), 'OK')
+
+
+# ============================================================
+# 无头模式
+# ============================================================
+
+def serve_mode():
+    """systemd 调用：只跑 WebDAV，前台。"""
+    cfg = load_config()
+    shares = [s for s in cfg['shares'] if 'webdav' in (s.get('protocols') or [])]
+    if not shares:
+        print('winsharemanager: 没有启用 WebDAV 的共享，服务空转。', flush=True)
+    srv = dav_start_server(cfg, quiet=True)
+    print('winsharemanager: WebDAV listening on :{}'.format(cfg.get('dav_port')), flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def probe_mode():
+    """部署自检：打印发行版 / 依赖 / 服务状态 / 配置摘要，退出码恒 0。"""
+    family_names = {'debian': 'Debian 系（apt）', 'arch': 'Arch 系（pacman）', 'unknown': '未知（按 Debian 处理）'}
+    print('distro   : {} ({}, {})'.format(DISTRO_PRETTY, DISTRO_ID, family_names.get(DISTRO_FAMILY)))
+    print('python   : {}'.format(platform.python_version()))
+    print('root     : {}'.format(os.geteuid() == 0))
+    print('tkinter  : {}'.format(_tkinter_available()))
+    cfg = load_config()
+    print('config   : {} ({} 个共享)'.format(CONFIG_PATH, len(cfg['shares'])))
+    for key in PROTOCOL_KEYS:
+        print('proto {} : {} / 状态 {}'.format(key.ljust(6), '已装' if protocol_installed(key) else '未装',
+                                              '运行' if protocol_status(key) else '停止'))
+    for s in cfg['shares']:
+        print('share    : {} -> {} [{}]'.format(s.get('name'), s.get('path'), ','.join(s.get('protocols') or [])))
+    return 0
+
+
+def _tkinter_available():
+    try:
+        import tkinter  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+# 图形界面（Tkinter，苹果风）
+# ============================================================
+
+def run_gui():
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+
+    BG = '#f5f5f7'
+    CARD = '#ffffff'
+    FG = '#1d1d1f'
+    SUB = '#6e6e73'
+    ACCENT = '#0071e3'
+    GREEN = '#34c759'
+    GRAY = '#d2d2d7'
+    RED = '#ff3b30'
+    FONT = ('Helvetica Neue', 12)
+    FONT_S = ('Helvetica Neue', 10)
+    FONT_B = ('Helvetica Neue', 14, 'bold')
+
+    cfg = load_config()
+    root = tk.Tk()
+    root.title('{} {} — 共享管理器'.format(APP_NAME, APP_VERSION))
+    root.geometry('980x720')
+    root.minsize(880, 620)
+    root.configure(bg=BG)
+
+    R.callback = lambda entry, level: root.after(0, _append_log, entry, level)
+
+    def _append_log(entry, level):
+        log_text.configure(state='normal')
+        log_text.insert('end', entry + '\n')
+        log_text.see('end')
+        log_text.configure(state='disabled')
+
+    # ---------- 顶部 ----------
+    header = tk.Frame(root, bg=BG)
+    header.pack(fill='x', padx=24, pady=(18, 6))
+    tk.Label(header, text='共享管理器', font=('Helvetica Neue', 20, 'bold'),
+             bg=BG, fg=FG).pack(side='left')
+    ver = tk.Label(header, text='v{} · {}'.format(APP_VERSION, DISTRO_PRETTY),
+                   font=FONT_S, bg=BG, fg=SUB)
+    ver.pack(side='left', padx=(10, 0), pady=(8, 0))
+    link = tk.Label(header, text='GitHub', font=FONT_S, bg=BG, fg=ACCENT, cursor='hand2')
+    link.pack(side='right')
+    link.bind('<Button-1>', lambda e: os.popen('xdg-open ' + GITHUB_URL))
+    sub = tk.Label(header, text='SMB · WebDAV · FTP · SFTP · DLNA — 改动即生效，系统服务常驻',
+                   font=FONT_S, bg=BG, fg=SUB)
+    sub.pack(side='right', padx=(0, 16), pady=(8, 0))
+
+    if os.geteuid() != 0:
+        tk.Label(root, text='⚠ 未以 root 运行：系统级修改会失败。请用 pkexec / sudo 启动。',
+                 font=FONT, bg='#fff3cd', fg='#856404', anchor='w', padx=16, pady=6
+                 ).pack(fill='x', padx=24)
+
+    body = tk.Frame(root, bg=BG)
+    body.pack(fill='both', expand=True, padx=24, pady=8)
+
+    # ---------- 协议卡片 ----------
+    cards_frame = tk.Frame(body, bg=BG)
+    cards_frame.pack(fill='x')
+    cards = {}
+
+    def toggle_proto(key):
+        running = protocol_status(key)
+        if running:
+            ok = stop_protocol(key)
+        else:
+            ok = start_protocol(key, cfg)
+            apply_ports(cfg)
+        refresh_all()
+        if ok:
+            save_config(cfg)
+
+    def install_proto(key):
+        ok = install_packages([key])
+        if ok:
+            R.log('{} 依赖已就绪。'.format(PROTO_META[key]['label']), 'OK')
+        refresh_all()
+
+    def make_card(key):
+        meta = PROTO_META[key]
+        card = tk.Frame(cards_frame, bg=CARD, highlightbackground=GRAY, highlightthickness=1)
+        card.pack(side='left', expand=True, fill='x', padx=(0, 12), ipadx=6, ipady=6)
+        tk.Label(card, text=meta['label'], font=FONT_B, bg=CARD, fg=FG).pack(anchor='w', padx=14, pady=(8, 0))
+        tk.Label(card, text=meta['hint'], font=FONT_S, bg=CARD, fg=SUB, wraplength=150,
+                 justify='left').pack(anchor='w', padx=14)
+        status = tk.Label(card, text='—', font=FONT_S, bg=CARD, fg=SUB)
+        status.pack(anchor='w', padx=14, pady=(2, 2))
+        btnrow = tk.Frame(card, bg=CARD)
+        btnrow.pack(fill='x', padx=10, pady=(0, 8))
+        tgl = tk.Button(btnrow, text='启动', font=FONT_S, relief='flat', cursor='hand2',
+                        bg=ACCENT, fg='#ffffff', activebackground='#0062c4', activeforeground='#ffffff',
+                        bd=0, padx=14, pady=3, command=lambda: toggle_proto(key))
+        tgl.pack(side='left')
+        ins = tk.Button(btnrow, text='安装', font=FONT_S, relief='flat', cursor='hand2',
+                        bg='#e8e8ed', fg=FG, activebackground='#dcdce1', bd=0,
+                        padx=10, pady=3, command=lambda: install_proto(key))
+        ins.pack(side='left', padx=(8, 0))
+        cards[key] = {'card': card, 'status': status, 'toggle': tgl, 'install': ins}
+
+    for i, k in enumerate(PROTOCOL_KEYS):
+        make_card(k)
+
+    # ---------- 共享列表 ----------
+    shares_frame = tk.Frame(body, bg=CARD, highlightbackground=GRAY, highlightthickness=1)
+    shares_frame.pack(fill='both', expand=True, pady=(14, 0))
+
+    sf_head = tk.Frame(shares_frame, bg=CARD)
+    sf_head.pack(fill='x', padx=16, pady=(12, 4))
+    tk.Label(sf_head, text='共享列表', font=FONT_B, bg=CARD, fg=FG).pack(side='left')
+    tk.Button(sf_head, text='＋ 新增共享', font=FONT_S, relief='flat', cursor='hand2',
+              bg=ACCENT, fg='#ffffff', activebackground='#0062c4', bd=0,
+              padx=12, pady=4, command=lambda: add_share_dialog()).pack(side='right')
+    tk.Button(sf_head, text='全部发布', font=FONT_S, relief='flat', cursor='hand2',
+              bg='#e8e8ed', fg=FG, activebackground='#dcdce1', bd=0,
+              padx=12, pady=4, command=lambda: on_apply_all()).pack(side='right', padx=(0, 8))
+
+    cols = ('name', 'path', 'protocols')
+    tree = ttk.Treeview(shares_frame, columns=cols, show='headings', height=7)
+    tree.heading('name', text='共享名')
+    tree.heading('path', text='物理路径')
+    tree.heading('protocols', text='协议')
+    tree.column('name', width=160)
+    tree.column('path', width=420)
+    tree.column('protocols', width=200)
+    tree.pack(fill='both', expand=True, padx=16, pady=(0, 4))
+
+    del_btn = tk.Button(shares_frame, text='删除选中共享', font=FONT_S, relief='flat', cursor='hand2',
+                        bg='#ffe5e5', fg=RED, activebackground='#ffd2d2', bd=0,
+                        padx=12, pady=4, command=lambda: del_share())
+    del_btn.pack(anchor='e', padx=16, pady=(0, 12))
+
+    # ---------- 日志 ----------
+    log_frame = tk.Frame(body, bg=BG)
+    log_frame.pack(fill='x', pady=(12, 4))
+    log_text = tk.Text(log_frame, height=7, font=('Menlo', 9), bg='#1d1d1f', fg='#e8e8ed',
+                       state='disabled', relief='flat', padx=10, pady=8)
+    log_text.pack(fill='x')
+
+    statusbar = tk.Label(root, text='就绪', font=FONT_S, bg=BG, fg=SUB, anchor='w')
+    statusbar.pack(fill='x', padx=24, pady=(0, 10))
+
+    # ---------- 行为 ----------
+    def refresh_all():
+        for key in PROTOCOL_KEYS:
+            c = cards[key]
+            installed = protocol_installed(key)
+            running = protocol_status(key) if installed else False
+            c['status'].config(text=('未安装' if not installed else ('运行中' if running else '已停止')),
+                               fg=(SUB if not installed else (GREEN if running else SUB)))
+            c['toggle'].config(text=('停止' if running else '启动'),
+                               bg=(GRAY if not installed else (RED if running else ACCENT)))
+            c['install'].config(state=('disabled' if installed else 'normal'),
+                                text=('已安装' if installed else '安装'))
+        for i in tree.get_children():
+            tree.delete(i)
+        for s in cfg['shares']:
+            tree.insert('', 'end', iid=s['name'],
+                        values=(s['name'], s['path'], ', '.join((s.get('protocols') or [])).upper()))
+        statusbar.config(text='{} 个共享 · {}'.format(len(cfg['shares']), DISTRO_PRETTY))
+
+    def on_apply_all():
+        if apply_shares(cfg):
+            R.log('全部共享已按当前配置发布。', 'OK')
+        refresh_all()
+
+    def add_share_dialog():
+        win = tk.Toplevel(root)
+        win.title('新增共享')
+        win.configure(bg=CARD)
+        win.resizable(False, False)
+        win.transient(root)
+        win.grab_set()
+        frm = tk.Frame(win, bg=CARD)
+        frm.pack(padx=20, pady=16)
+        tk.Label(frm, text='共享名', font=FONT, bg=CARD, fg=FG).grid(row=0, column=0, sticky='w', pady=4)
+        e_name = tk.Entry(frm, font=FONT, width=28, relief='flat', highlightbackground=GRAY,
+                          highlightthickness=1)
+        e_name.grid(row=0, column=1, pady=4, padx=(10, 0))
+        tk.Label(frm, text='物理路径', font=FONT, bg=CARD, fg=FG).grid(row=1, column=0, sticky='w', pady=4)
+        e_path = tk.Entry(frm, font=FONT, width=28, relief='flat', highlightbackground=GRAY,
+                          highlightthickness=1)
+        e_path.grid(row=1, column=1, pady=4, padx=(10, 0))
+        tk.Button(frm, text='浏览…', font=FONT_S, relief='flat', bg='#e8e8ed', fg=FG, bd=0,
+                  padx=10, pady=2, command=lambda: e_path.insert(0, filedialog.askdirectory() or '')
+                  ).grid(row=1, column=2, padx=(6, 0))
+        tk.Label(frm, text='协议', font=FONT, bg=CARD, fg=FG).grid(row=2, column=0, sticky='nw', pady=4)
+        proto_vars = {}
+        pf = tk.Frame(frm, bg=CARD)
+        pf.grid(row=2, column=1, columnspan=2, sticky='w', padx=(10, 0))
+        for i, k in enumerate(PROTOCOL_KEYS):
+            v = tk.BooleanVar(value=(k in ('smb', 'sftp')))
+            proto_vars[k] = v
+            ttk.Checkbutton(pf, text=PROTO_META[k]['label'], variable=v).grid(
+                row=i // 3, column=i % 3, sticky='w', padx=(0, 8), pady=2)
+        tk.Label(frm, text='SMB 账号（系统用户，可留空）', font=FONT_S, bg=CARD, fg=SUB
+                 ).grid(row=3, column=0, columnspan=3, sticky='w', pady=(8, 0))
+        e_user = tk.Entry(frm, font=FONT, width=28, relief='flat', highlightbackground=GRAY,
+                          highlightthickness=1)
+        e_user.grid(row=4, column=0, columnspan=2, sticky='w', pady=2)
+        tk.Label(frm, text='密码', font=FONT_S, bg=CARD, fg=SUB).grid(row=4, column=2, sticky='w', padx=(6, 0))
+        e_pwd = tk.Entry(frm, font=FONT, width=20, show='•', relief='flat',
+                         highlightbackground=GRAY, highlightthickness=1)
+        e_pwd.grid(row=4, column=2, sticky='e', pady=2)
+
+        def on_ok():
+            name = e_name.get().strip()
+            path = e_path.get().strip()
+            if not name or '/' in name or name in ('.', '..'):
+                messagebox.showwarning('提示', '共享名不能为空且不能包含 /', parent=win)
+                return
+            if get_share(cfg, name):
+                messagebox.showwarning('提示', '共享 {} 已存在'.format(name), parent=win)
+                return
+            if not path:
+                messagebox.showwarning('提示', '物理路径不能为空', parent=win)
+                return
+            path = os.path.normpath(path)
+            if not os.path.isdir(path):
+                if not messagebox.askyesno('提示', '目录不存在，自动创建 {}？'.format(path), parent=win):
+                    return
+                os.makedirs(path, exist_ok=True)
+            protos = [k for k in PROTOCOL_KEYS if proto_vars[k].get()]
+            if not protos:
+                messagebox.showwarning('提示', '至少勾选一个协议', parent=win)
+                return
+            entry = {'name': name, 'path': path, 'protocols': protos, 'smb_users': []}
+            if 'smb' in protos and e_user.get().strip():
+                entry['smb_users'] = [{'name': e_user.get().strip(), 'password': e_pwd.get()}]
+            cfg['shares'].append(entry)
+            save_config(cfg)
+            win.destroy()
+            if apply_shares(cfg):
+                R.log('共享 {} 已创建并发布。'.format(name), 'OK')
+            refresh_all()
+
+        btnf = tk.Frame(win, bg=CARD)
+        btnf.pack(fill='x', padx=20, pady=(0, 16))
+        tk.Button(btnf, text='创建并发布', font=FONT, relief='flat', cursor='hand2',
+                  bg=ACCENT, fg='#ffffff', activebackground='#0062c4', bd=0,
+                  padx=16, pady=5, command=on_ok).pack(side='right')
+        tk.Button(btnf, text='取消', font=FONT, relief='flat', cursor='hand2',
+                  bg='#e8e8ed', fg=FG, bd=0, padx=16, pady=5,
+                  command=win.destroy).pack(side='right', padx=(0, 8))
+
+    def del_share():
+        sel = tree.selection()
+        if not sel:
+            return
+        name = sel[0]
+        if not messagebox.askyesno('确认', '删除共享 {}？\n（只取消发布，不动磁盘文件）'.format(name)):
+            return
+        cfg['shares'] = [s for s in cfg['shares'] if s['name'] != name]
+        save_config(cfg)
+        if apply_shares(cfg):
+            R.log('共享 {} 已取消发布。'.format(name), 'OK')
+        refresh_all()
+
+    def on_close():
+        R.callback = None
+        root.destroy()
+
+    root.protocol('WM_DELETE_WINDOW', on_close)
+    refresh_all()
+    root.mainloop()
+
+
+# ============================================================
+# 入口
+# ============================================================
+
+def main():
+    args = sys.argv[1:]
+    if '--serve' in args:
+        serve_mode()
+        return 0
+    if '--probe' in args:
+        return probe_mode()
+    if '--version' in args:
+        print('WinShareManager for Linux v{} ({})'.format(APP_VERSION, DISTRO_ID))
+        return 0
+    if os.geteuid() != 0 and os.environ.get('WSM_NO_REEXEC') != '1':
+        # pkexec 提权重启（桌面环境会弹密码框）；无桌面则提示 sudo
+        exe = os.path.abspath(__file__)
+        try:
+            os.execvp('pkexec', ['pkexec', sys.executable, exe] + args)
+        except OSError:
+            pass
+        print('需要 root 权限：请用 sudo 运行本程序。', file=sys.stderr)
+        return 1
+    if not _tkinter_available():
+        print('缺少 tkinter：Ubuntu 执行 apt install python3-tk；CachyOS 执行 pacman -S tk', file=sys.stderr)
+        return 1
+    run_gui()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

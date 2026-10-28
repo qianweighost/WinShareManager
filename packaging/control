@@ -1,0 +1,14 @@
+Package: winsharemanager
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: all
+Maintainer: qianwei <qianwei@users.noreply.github.com>
+Depends: python3 (>= 3.8), python3-tk, policykit-1 | polkitd
+Recommends: samba, vsftpd, minidlna, openssh-server
+Suggests: ufw, firewalld
+Homepage: https://github.com/qianweighost/WinShareManager
+Description: SMB / WebDAV / FTP / SFTP / DLNA sharing manager with Apple-style GUI
+ WinShareManager manages LAN file sharing protocols from one window:
+ samba, a built-in WebDAV server (systemd unit), vsftpd, sshd and minidlna.
+ Designed for Ubuntu / Debian and CachyOS / Arch (see PKGBUILD for Arch).

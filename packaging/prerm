@@ -1,0 +1,11 @@
+#!/bin/sh
+# prerm — WinShareManager for Linux
+set -e
+
+# 停掉我们管理的 WebDAV 服务（其余协议是系统服务，卸载不动它们）
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop winsharemanager-webdav.service 2>/dev/null || true
+    systemctl disable winsharemanager-webdav.service 2>/dev/null || true
+fi
+rm -f /etc/systemd/system/winsharemanager-webdav.service
+exit 0

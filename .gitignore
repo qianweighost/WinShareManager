@@ -17,3 +17,4 @@ _bak/
 .idea/
 Thumbs.db
 desktop.ini
+__pycache__/
